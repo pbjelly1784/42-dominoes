@@ -4,7 +4,153 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const path = require('path');
-const { deal, tileScore, trickWinner, validBidsFor, scoreHand, isTrump } = require('./src/gameLogic');
+
+// ─── Game Logic ───────────────────────────────────────────────────────────────
+
+function makeDominoes() {
+  const tiles = [];
+  for (let hi = 0; hi <= 6; hi++) {
+    for (let lo = 0; lo <= hi; lo++) {
+      tiles.push({ hi, lo, id: `${hi}-${lo}` });
+    }
+  }
+  return tiles;
+}
+
+function shuffle(arr) {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+function deal() {
+  const tiles = shuffle(makeDominoes());
+  return [
+    tiles.slice(0, 7),
+    tiles.slice(7, 14),
+    tiles.slice(14, 21),
+    tiles.slice(21, 28),
+  ];
+}
+
+function tileScore(tile) {
+  const sum = tile.hi + tile.lo;
+  return (sum === 5 || sum === 10) ? sum : 0;
+}
+
+function isTrump(tile, trump) {
+  if (trump === null) return false;
+  return tile.hi === trump || tile.lo === trump;
+}
+
+function trickWinner(plays, trump) {
+  const lead = plays[0];
+  const ledValue = (() => {
+    if (isTrump(lead.tile, trump)) return 'trump';
+    if (lead.tile.hi === trump) return lead.tile.lo;
+    return lead.tile.hi;
+  })();
+
+  let winner = lead;
+  let winnerIsTrump = isTrump(lead.tile, trump);
+
+  for (let i = 1; i < plays.length; i++) {
+    const p = plays[i];
+    const pTrump = isTrump(p.tile, trump);
+
+    if (pTrump && !winnerIsTrump) {
+      winner = p;
+      winnerIsTrump = true;
+    } else if (pTrump && winnerIsTrump) {
+      const wPip = Math.max(winner.tile.hi, winner.tile.lo);
+      const pPip = Math.max(p.tile.hi, p.tile.lo);
+      if (pPip > wPip) winner = p;
+    } else if (!pTrump && !winnerIsTrump) {
+      const pSuit = p.tile.hi === trump ? p.tile.lo : p.tile.hi;
+      if (pSuit === ledValue) {
+        const wPip = Math.max(winner.tile.hi, winner.tile.lo);
+        const pPip = Math.max(p.tile.hi, p.tile.lo);
+        if (pPip > wPip) winner = p;
+      }
+    }
+  }
+  return winner.seatIndex;
+}
+
+function validBidsFor(highBid, seatIndex, hand) {
+  const bids = [];
+  for (let b = 30; b <= 42; b++) {
+    if (b > (highBid.amount || 29) && !highBid.special) {
+      bids.push({ amount: b, special: null, label: String(b) });
+    }
+  }
+  const doubles = [84, 126, 168, 210];
+  for (const d of doubles) {
+    if (d > (highBid.amount || 0) && !highBid.special) {
+      bids.push({ amount: d, special: null, label: String(d) });
+    }
+  }
+  if (!highBid.special) {
+    bids.push({ amount: 42, special: 'low', label: 'Low' });
+  }
+  const doubleCount = hand.filter(t => t.hi === t.lo).length;
+  if (doubleCount >= 4 && !highBid.special && (highBid.amount || 0) < 42) {
+    bids.push({ amount: 84, special: 'plunge', label: 'Plunge' });
+  }
+  bids.push({ amount: 42, special: 'follow_me', label: 'Follow Me' });
+  bids.push({ amount: 0, special: 'pass', label: 'Pass' });
+  return bids;
+}
+
+function scoreHand(bid, trickCount, pointsTaken) {
+  const bidTeam = bid.seatIndex % 2;
+  const defTeam = 1 - bidTeam;
+
+  const bt0 = bidTeam === 0 ? 0 : 1;
+  const bt1 = bidTeam === 0 ? 2 : 3;
+  const bidTeamTricks = trickCount[bt0] + trickCount[bt1];
+  const bidTeamPoints = pointsTaken[bt0] + pointsTaken[bt1];
+
+  let delta = { 0: 0, 1: 0 };
+
+  if (bid.special === 'plunge') {
+    const won = bidTeamTricks === 7;
+    delta[won ? bidTeam : defTeam] = 4;
+    return delta;
+  }
+
+  if (bid.special === 'follow_me') {
+    const won = bidTeamPoints + bidTeamTricks >= 42;
+    delta[won ? bidTeam : defTeam] = 1;
+    return delta;
+  }
+
+  if (bid.special === 'low') {
+    const bidTeamTotal = bidTeamPoints + bidTeamTricks;
+    const defTeamTotal = 42 - bidTeamTotal;
+    const won = bidTeamTotal < defTeamTotal;
+    delta[won ? bidTeam : defTeam] = 1;
+    return delta;
+  }
+
+  const bidScore = bidTeamPoints + bidTeamTricks;
+  const won = bidScore >= bid.amount;
+
+  let marks = 1;
+  if (bid.amount === 84)  marks = 2;
+  if (bid.amount === 126) marks = 3;
+  if (bid.amount === 168) marks = 4;
+  if (bid.amount === 210) marks = 5;
+  if (bid.amount === 42 && won && bidTeamTricks === 7) marks = 2;
+
+  delta[won ? bidTeam : defTeam] = marks;
+  return delta;
+}
+
+// ─── Express + Socket.io setup ────────────────────────────────────────────────
 
 const app = express();
 const server = http.createServer(app);
@@ -15,25 +161,25 @@ app.get('/', (_, res) => res.sendFile(path.join(__dirname, 'public', 'index.html
 
 // ─── Room storage ─────────────────────────────────────────────────────────────
 
-const rooms = new Map(); // roomCode -> Room
+const rooms = new Map();
 
 function makeRoom(code) {
   return {
     code,
-    seats: [null, null, null, null], // { socketId, name }
-    state: 'lobby',    // lobby | bidding | trump_select | playing | hand_end | game_over
+    seats: [null, null, null, null],
+    state: 'lobby',
     hands: [[], [], [], []],
-    bid: null,         // { amount, special, seatIndex, label }
-    bids: [],          // history per round
+    bid: null,
+    bids: [],
     currentBidder: 0,
     passCount: 0,
-    trump: null,       // 0-6 or null
-    trick: [],         // [{ seatIndex, tile }]
+    trump: null,
+    trick: [],
     tricksTaken: [0, 0, 0, 0],
     pointsTaken: [0, 0, 0, 0],
     trickCount: [0, 0, 0, 0],
     currentPlayer: 0,
-    score: [0, 0],     // marks: team0, team1
+    score: [0, 0],
     dealer: 0,
     lastTrick: null,
     handHistory: [],
@@ -62,7 +208,6 @@ function roomSummary(room) {
 }
 
 function broadcastRoom(room) {
-  // Send each player their own hand privately, rest is public
   for (let i = 0; i < 4; i++) {
     const seat = room.seats[i];
     if (!seat) continue;
@@ -104,33 +249,17 @@ function startBidding(room) {
 
 function advanceBidder(room) {
   room.currentBidder = (room.currentBidder + 1) % 4;
-  // Skip if passed
-  const startSeat = room.currentBidder;
   let loops = 0;
   while (room.bids.find(b => b.seatIndex === room.currentBidder && b.special === 'pass')) {
     room.currentBidder = (room.currentBidder + 1) % 4;
     if (++loops > 4) break;
-    if (room.currentBidder === startSeat) break;
   }
 }
 
 function checkBiddingDone(room) {
-  // Count active (non-passed) bidders
   const passed = new Set(room.bids.filter(b => b.special === 'pass').map(b => b.seatIndex));
   const active = [0, 1, 2, 3].filter(i => !passed.has(i));
   return active.length === 1 || room.bid.special === 'plunge' || room.bid.special === 'follow_me';
-}
-
-function openTrumpSelect(room) {
-  room.state = 'trump_select';
-  broadcastRoom(room);
-}
-
-function startPlay(room, trump) {
-  room.trump = trump;
-  room.state = 'playing';
-  room.currentPlayer = room.bid.seatIndex; // winner of bid leads first
-  broadcastRoom(room);
 }
 
 function resolveHand(room) {
@@ -178,8 +307,8 @@ io.on('connection', (socket) => {
     if (emptySeat === -1) { socket.emit('error', 'Room is full'); return; }
 
     room.seats[emptySeat] = { socketId: socket.id, name };
-    socket.join(code);
-    socket.emit('joined', { code, seat: emptySeat, name });
+    socket.join(code.toUpperCase());
+    socket.emit('joined', { code: room.code, seat: emptySeat, name });
     broadcastRoom(room);
   });
 
@@ -210,16 +339,12 @@ io.on('connection', (socket) => {
     if (special === 'pass') {
       room.bids.push(thisBid);
       room.passCount++;
-      // If 3 passed and someone has bid, or all 4 passed dealer must take 30
       const passed = room.bids.filter(b => b.special === 'pass').length;
       if (passed === 3 && room.bid.seatIndex !== -1) {
-        // bidding done
-        room.bids.push(thisBid); // ensure recorded
         openTrumpSelect(room);
         return;
       }
       if (passed === 4) {
-        // Force dealer to bid 30
         room.bid = { amount: 30, special: null, seatIndex: room.dealer, label: '30 (forced)' };
         room.bids.push(room.bid);
         openTrumpSelect(room);
@@ -230,7 +355,6 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // Non-pass
     room.bid = thisBid;
     room.bids.push(thisBid);
 
@@ -242,6 +366,11 @@ io.on('connection', (socket) => {
     }
   });
 
+  function openTrumpSelect(room) {
+    room.state = 'trump_select';
+    broadcastRoom(room);
+  }
+
   socket.on('selectTrump', ({ trump }) => {
     const found = findRoomBySocket(socket.id);
     if (!found) return;
@@ -249,7 +378,10 @@ io.on('connection', (socket) => {
     if (room.state !== 'trump_select') return;
     if (room.bid.seatIndex !== seat) { socket.emit('error', 'Only the bid winner selects trump'); return; }
     if (trump < 0 || trump > 6) return;
-    startPlay(room, trump);
+    room.trump = trump;
+    room.state = 'playing';
+    room.currentPlayer = room.bid.seatIndex;
+    broadcastRoom(room);
   });
 
   socket.on('playTile', ({ tileId }) => {
@@ -263,22 +395,23 @@ io.on('connection', (socket) => {
     const tileIdx = hand.findIndex(t => t.id === tileId);
     if (tileIdx === -1) { socket.emit('error', 'Tile not in hand'); return; }
 
-    // Basic follow-suit validation (only if not leading)
     if (room.trick.length > 0) {
       const leadTile = room.trick[0].tile;
       const trump = room.trump;
       const leadIsThump = isTrump(leadTile, trump);
       const leadSuit = leadIsThump ? trump : (leadTile.hi === trump ? leadTile.lo : leadTile.hi);
-
       const tile = hand[tileIdx];
       const tileIsTrump = isTrump(tile, trump);
+
       const canFollowSuit = hand.some(t => {
         if (leadIsThump) return isTrump(t, trump);
         return !isTrump(t, trump) && (t.hi === leadSuit || t.lo === leadSuit);
       });
 
       if (canFollowSuit) {
-        const follows = leadIsThump ? tileIsTrump : (!tileIsTrump && (tile.hi === leadSuit || tile.lo === leadSuit));
+        const follows = leadIsThump
+          ? tileIsTrump
+          : (!tileIsTrump && (tile.hi === leadSuit || tile.lo === leadSuit));
         if (!follows) { socket.emit('error', 'Must follow suit'); return; }
       }
     }
@@ -287,9 +420,8 @@ io.on('connection', (socket) => {
     room.trick.push({ seatIndex: seat, tile });
 
     if (room.trick.length === 4) {
-      // Resolve trick
       const winnerSeat = trickWinner(room.trick, room.trump);
-      const pts = room.trick.reduce((s, p) => s + tileScore(p.tile), 0) + 1; // +1 for trick point
+      const pts = room.trick.reduce((s, p) => s + tileScore(p.tile), 0) + 1;
       room.pointsTaken[winnerSeat] += pts;
       room.trickCount[winnerSeat]++;
       room.tricksTaken[winnerSeat]++;
@@ -319,7 +451,7 @@ io.on('connection', (socket) => {
     const found = findRoomBySocket(socket.id);
     if (!found) return;
     const { room, seat } = found;
-    room.seats[seat] = { ...room.seats[seat], disconnected: true };
+    if (room.seats[seat]) room.seats[seat] = { ...room.seats[seat], disconnected: true };
     broadcastRoom(room);
   });
 
