@@ -156,8 +156,9 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
-app.use(express.static(path.join(__dirname, 'public')));
-app.get('/', (_, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+const publicDir = path.join(__dirname, 'public');
+app.use(express.static(publicDir));
+app.get('*', (_, res) => res.sendFile(path.join(publicDir, 'index.html')));
 
 // ─── Room storage ─────────────────────────────────────────────────────────────
 
