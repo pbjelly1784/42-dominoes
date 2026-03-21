@@ -369,17 +369,29 @@ function botChooseBid(availableBids, hand, allBids, seatIndex) {
 // ── Bot Trump Selection ───────────────────────────────────────────────────────
 
 function botChooseTrump(hand) {
-  // Count tiles per suit (both ends), weighted by tile strength
-  const suitScore = Array(7).fill(0);
+  // Count how many tiles contain each suit number (both ends, doubles count once)
+  const suitCount = Array(7).fill(0);
+  const suitLoSum = Array(7).fill(0); // sum of lo-ends for tiles in this suit (tiebreaker)
+
   hand.forEach(t => {
-    const score = tileStrength(t) + (tileScore(t) > 0 ? 5 : 0); // bonus for count tiles
-    suitScore[t.hi] += score;
-    if (t.hi !== t.lo) suitScore[t.lo] += score;
+    // hi end
+    suitCount[t.hi]++;
+    suitLoSum[t.hi] += t.lo;
+    // lo end (if not double — doubles only counted once)
+    if (t.hi !== t.lo) {
+      suitCount[t.lo]++;
+      suitLoSum[t.lo] += t.hi; // from lo's perspective, the "other end" is hi
+    }
   });
-  // Pick suit with highest score
+
+  // Pick suit with most tiles; tiebreak on sum of lo-ends (higher = stronger tiles)
   let best = 0;
   for (let i = 1; i < 7; i++) {
-    if (suitScore[i] > suitScore[best]) best = i;
+    if (suitCount[i] > suitCount[best]) {
+      best = i;
+    } else if (suitCount[i] === suitCount[best] && suitLoSum[i] > suitLoSum[best]) {
+      best = i;
+    }
   }
   return best;
 }
@@ -532,8 +544,7 @@ function scheduleBotAction(room) {
       if (room.state !== 'trump_select' && room.state !== 'plunge_trump_select') return;
       if (room.trumpSelector !== seat) return;
       const trump = botChooseTrump(room.hands[seat]);
-      startPlay(room, trump, false);
-      scheduleBotAction(room);
+      startPlay(room, trump, false); // startPlay calls scheduleBotAction internally
     }, botDelay());
 
   } else if (state === 'playing') {
@@ -1515,12 +1526,14 @@ function openTrumpSelect(room) {
   if (bid.type === 'plunge') {
     room.trumpSelector = (bid.seatIndex + 2) % 4; // partner picks trump & leads
     room.state = 'plunge_trump_select';
-    broadcast(room); return;
+    broadcast(room);
+    scheduleBotAction(room); return;
   }
   // High / follow_me — bidder selects
   room.trumpSelector = bid.seatIndex;
   room.state = 'trump_select';
   broadcast(room);
+  scheduleBotAction(room);
 }
 
 function startPlay(room, trump, followMe) {
