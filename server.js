@@ -48,48 +48,68 @@ function tileSuit(tile, trump) {
 
 // Pip strength of a tile within its suit
 // Doubles are highest within their suit (strength = 100 + number)
-// Non-doubles: strength = max pip
+// Non-doubles: primary = hi end (suit), tiebreaker = lo end
+// e.g. 5-3 > 5-2 > 5-1 because lo end 3 > 2 > 1
 function tileStrength(tile) {
   if (isDouble(tile)) return 100 + tile.hi;
-  return Math.max(tile.hi, tile.lo);
+  // hi*10 + lo: within same suit (same hi), lo end breaks ties
+  return tile.hi * 10 + tile.lo;
+}
+
+// In 42 Low, doubles are their own suit separate from all numbers
+function lowSuitOf(tile) {
+  if (isDouble(tile)) return 'double';
+  return tile.hi; // higher end is the suit for non-doubles
 }
 
 // Determine trick winner
 // plays = [{seatIndex, tile}, ...], plays[0] is the lead
 // trump = 0-6 or null
-function trickWinner(plays, trump) {
+// isLow = true for 42 Low hands (doubles are own suit)
+function trickWinner(plays, trump, isLow) {
   const leadTile = plays[0].tile;
+
+  if (isLow) {
+    // 42 Low: no trump, doubles are their own suit
+    const ledSuit = lowSuitOf(leadTile);
+    let best = plays[0];
+    for (let i = 1; i < plays.length; i++) {
+      const p = plays[i];
+      const pSuit = lowSuitOf(p.tile);
+      const bestSuit = lowSuitOf(best.tile);
+      if (pSuit === ledSuit) {
+        if (bestSuit !== ledSuit) {
+          best = p; // challenger follows suit, current best doesn't
+        } else {
+          // Both follow led suit — higher strength wins
+          if (tileStrength(p.tile) > tileStrength(best.tile)) best = p;
+        }
+      }
+      // Off-suit cannot win
+    }
+    return best.seatIndex;
+  }
+
+  // Normal / high hand logic
   const ledSuit = tileSuit(leadTile, trump);
   const leadIsTrump = isTrump(leadTile, trump);
-
   let best = plays[0];
   let bestIsTrump = leadIsTrump;
 
   for (let i = 1; i < plays.length; i++) {
     const p = plays[i];
     const pTrump = isTrump(p.tile, trump);
-
     if (pTrump && !bestIsTrump) {
-      // Trump beats non-trump
       best = p; bestIsTrump = true;
     } else if (pTrump && bestIsTrump) {
-      // Both trump: higher strength wins (doubles are highest trump)
       if (tileStrength(p.tile) > tileStrength(best.tile)) best = p;
     } else if (!pTrump && !bestIsTrump) {
-      // Both non-trump
       const pSuit = tileSuit(p.tile, trump);
       const bestSuit = tileSuit(best.tile, trump);
       if (pSuit === ledSuit) {
-        // Challenger follows suit
-        if (bestSuit !== ledSuit) {
-          // Current best is off-suit (shouldn't happen with renege rules but safety)
-          best = p;
-        } else {
-          // Both follow suit: doubles win over non-doubles, else higher strength
-          if (tileStrength(p.tile) > tileStrength(best.tile)) best = p;
-        }
+        if (bestSuit !== ledSuit) best = p;
+        else if (tileStrength(p.tile) > tileStrength(best.tile)) best = p;
       }
-      // Off-suit non-trump cannot win
     }
   }
   return best.seatIndex;
@@ -99,17 +119,19 @@ function trickWinner(plays, trump) {
 function isLegalPlay(tile, hand, trick, trump, bidType, trickTrump) {
   if (trick.length === 0) return true;
   const leadTile = trick[0].tile;
+
+  if (bidType === 'low') {
+    // 42 Low: doubles are their own suit, non-doubles follow high end
+    const ledSuit = lowSuitOf(leadTile);
+    const tileInSuit = lowSuitOf(tile) === ledSuit;
+    const canFollow = hand.some(t => lowSuitOf(t) === ledSuit);
+    if (!canFollow) return true;
+    return tileInSuit;
+  }
+
   const effectiveTrump = bidType === 'follow_me' ? trickTrump : trump;
   const leadIsTrump = isTrump(leadTile, effectiveTrump);
   const ledSuit = leadIsTrump ? effectiveTrump : leadTile.hi;
-
-  if (effectiveTrump === null || effectiveTrump === undefined) {
-    // No-trump (low hand): follow high-end suit, doubles follow their number
-    const ledSuitLow = leadTile.hi;
-    const canFollow = hand.some(t => t.hi === ledSuitLow || t.lo === ledSuitLow);
-    if (!canFollow) return true;
-    return tile.hi === ledSuitLow || tile.lo === ledSuitLow;
-  }
 
   const tileIsT = isTrump(tile, effectiveTrump);
   const canFollowTrump = hand.some(t => isTrump(t, effectiveTrump));
@@ -647,9 +669,17 @@ function renderGame(state){
   }
 }
 
+function lowSuitOf(tile){return tile.hi===tile.lo?'double':tile.hi}
 function legalClient(tile,hand,trick,trump,bidType,trickTrump){
   if(trick.length===0)return true;
   const leadTile=trick[0].tile;
+  if(bidType==='low'){
+    const ls=lowSuitOf(leadTile);
+    const tileInSuit=lowSuitOf(tile)===ls;
+    const canFollow=hand.some(t=>lowSuitOf(t)===ls);
+    if(!canFollow)return true;
+    return tileInSuit;
+  }
   const et=bidType==='follow_me'?trickTrump:trump;
   if(et===null||et===undefined){
     const ls=leadTile.hi;const can=hand.some(t=>t.hi===ls||t.lo===ls);
@@ -719,7 +749,12 @@ function renderBoneyard(state){
 function renderBidPanel(state){
   const bids=state.availableBids||[];
   const cur=state.bid&&state.bid.amount>0?state.bid.label:'None';
-  $$('bid-panel-sub').textContent='Current: '+cur;
+  let bidHolder='';
+  if(state.bid&&state.bid.seatIndex>=0&&state.bid.amount>0){
+    const holderSeat=state.seats[state.bid.seatIndex];
+    bidHolder=holderSeat?' — '+holderSeat.name:'';
+  }
+  $$('bid-panel-sub').textContent='Current: '+cur+bidHolder;
   const grid=$$('bid-buttons');grid.innerHTML='';
   bids.forEach(bid=>{
     const cls='bid-btn'+(bid.type==='pass'?' pass-btn':bid.type==='low'?' low-btn':bid.type==='plunge'?' plunge-btn':bid.amount>=84?' double-btn':'');
@@ -1157,7 +1192,7 @@ io.on('connection', socket => {
     if (room.trick.length === active.length) {
       // Resolve trick
       const et = room.bidType === 'follow_me' ? room.trickTrump : room.trump;
-      const winner = trickWinner(room.trick, et);
+      const winner = trickWinner(room.trick, et, room.bidType === 'low');
 
       const pts = room.trick.reduce((s,p) => s + tileScore(p.tile), 0) + 1;
       room.pointsTaken[winner] += pts;
