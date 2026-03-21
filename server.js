@@ -400,6 +400,7 @@ function botChooseTrump(hand) {
 
 function botChooseTile(hand, trick, trump, bidType, trickTrump, seatIndex, bid) {
   const effectiveTrump = bidType === 'follow_me' ? trickTrump : trump;
+  const hasTrump = effectiveTrump !== null && effectiveTrump !== undefined;
   const isLow = bidType === 'low';
   const isBidder = bid && bid.seatIndex === seatIndex;
   const bidTeam = bid ? bid.seatIndex % 2 : -1;
@@ -408,108 +409,145 @@ function botChooseTile(hand, trick, trump, bidType, trickTrump, seatIndex, bid) 
 
   // Filter to legal plays only
   const legal = hand.filter(t => isLegalPlay(t, hand, trick, trump, bidType, trickTrump));
+  if (!legal.length) return hand[0]; // safety fallback — should never happen
 
-  if (legal.length === 1) return legal[0];
+  // Helper: lowest tile by overall strength
+  const lowest  = arr => arr.reduce((w, t) => tileStrength(t) < tileStrength(w) ? t : w, arr[0]);
+  const highest = arr => arr.reduce((w, t) => tileStrength(t) > tileStrength(w) ? t : w, arr[0]);
+  // Lowest non-count tile, fallback to lowest count
+  const dump = arr => {
+    const nc = arr.filter(t => tileScore(t) === 0);
+    return lowest(nc.length ? nc : arr);
+  };
 
   // ── 42 Low strategy ──
   if (isLow) {
     if (isBidder) {
-      // Bidder wants to LOSE all tricks — lead/play lowest possible
-      return legal.reduce((w, t) => tileStrength(t) < tileStrength(w) ? t : w, legal[0]);
+      return lowest(legal); // always play lowest — never want to win
     } else {
-      // Opponent wants to FORCE bidder to win
-      if (trick.length === 0) {
-        // Lead a suit bidder likely has to force them to win
-        // Lead highest tile to make bidder play high
-        return legal.reduce((w, t) => tileStrength(t) > tileStrength(w) ? t : w, legal[0]);
-      }
-      // Try to play low so bidder has to take the trick
-      return legal.reduce((w, t) => tileStrength(t) < tileStrength(w) ? t : w, legal[0]);
+      // Opponents: try to force bidder to take the trick
+      if (trick.length === 0) return highest(legal); // lead high to pressure bidder
+      // Play low — let the bidder be forced to beat it
+      return lowest(legal);
     }
   }
 
-  // ── Normal / high strategy ──
+  // ── Normal / high strategy — Leading ──
   if (trick.length === 0) {
-    // Leading a trick
     if (onBidTeam) {
-      // Lead count tiles if we have strong suit coverage, else lead strong suit
+      // Late game: lead count tiles to collect points
       const countTiles = legal.filter(t => tileScore(t) > 0);
-      if (countTiles.length > 0 && hand.length <= 4) {
-        // Late game — lead count to capture points
-        return countTiles.reduce((w, t) => tileStrength(t) > tileStrength(w) ? t : w, countTiles[0]);
-      }
-      // Lead strongest non-count tile (establish suit control)
+      if (countTiles.length > 0 && hand.length <= 3) return highest(countTiles);
+      // Lead strongest non-count (establish control)
       const nonCount = legal.filter(t => tileScore(t) === 0);
-      if (nonCount.length > 0) {
-        return nonCount.reduce((w, t) => tileStrength(t) > tileStrength(w) ? t : w, nonCount[0]);
-      }
+      if (nonCount.length > 0) return highest(nonCount);
+      return highest(legal);
     } else {
-      // Defense: lead lowest to avoid giving points
-      return legal.reduce((w, t) => tileStrength(t) < tileStrength(w) ? t : w, legal[0]);
+      // Defense: lead low, don't give away points
+      return dump(legal);
     }
-    return legal[0];
   }
 
-  // Following a trick
-  const leadTile = trick[0].tile;
-  const leadIsTrump = effectiveTrump !== null && effectiveTrump !== undefined && isTrump(leadTile, effectiveTrump);
-  const ledSuit = leadIsTrump ? effectiveTrump : leadTile.hi;
+  // ── Normal / high strategy — Following ──
+  const leadTile   = trick[0].tile;
+  const leadIsT    = hasTrump && isTrump(leadTile, effectiveTrump);
+  const ledSuit    = leadIsT ? effectiveTrump : leadTile.hi;
 
-  // Determine current winning play
-  const currentWinner = trickWinner(trick, effectiveTrump, isLow);
-  const currentWinnerTeam = currentWinner % 2;
-  const weAreWinning = currentWinnerTeam === myTeam;
+  // Current trick winner and their team
+  const currentWinner     = trickWinner(trick, effectiveTrump, false);
+  const winnerTeam        = currentWinner % 2;
+  const partnerWinning    = winnerTeam === myTeam;
+  const opponentWinning   = !partnerWinning;
 
-  // Points in this trick so far
-  const trickPts = trick.reduce((s, p) => s + tileScore(p.tile), 0);
-  const worthFighting = trickPts > 0 || trick.some(p => tileScore(p.tile) > 0);
+  // Points at stake in this trick
+  const trickHasCount     = trick.some(p => tileScore(p.tile) > 0);
 
-  const inSuit = legal.filter(t => {
-    if (leadIsTrump) return isTrump(t, effectiveTrump);
-    return !isTrump(t, effectiveTrump) && (t.hi === ledSuit || t.lo === ledSuit);
-  });
-  const trumpInHand = legal.filter(t => effectiveTrump !== null && effectiveTrump !== undefined && isTrump(t, effectiveTrump));
-  const offSuit = legal.filter(t => !isTrump(t, effectiveTrump) && !(t.hi === ledSuit || t.lo === ledSuit));
+  // Categorise legal tiles
+  const inSuit     = legal.filter(t => leadIsT ? isTrump(t, effectiveTrump) : (!isTrump(t, effectiveTrump) && (t.hi === ledSuit || t.lo === ledSuit)));
+  const myTrumps   = hasTrump ? legal.filter(t => isTrump(t, effectiveTrump)) : [];
+  const offSuit    = legal.filter(t => !inSuit.includes(t) && !myTrumps.includes(t));
 
+  // Strength within led suit
+  const sStr = t => tileInSuitStrength(t, ledSuit);
+
+  // Can we beat the current winner within suit?
+  const curWinTile = trick.find(p => p.seatIndex === currentWinner)?.tile;
+  const curWinStr  = curWinTile ? (leadIsT ? tileStrength(curWinTile) : sStr(curWinTile)) : 0;
+  const inSuitWinners  = inSuit.filter(t => (leadIsT ? tileStrength(t) : sStr(t)) > curWinStr);
+  const trumpWinners   = myTrumps.filter(t => !leadIsT); // trumping a non-trump lead always wins (unless higher trump out)
+
+  // ── Bidding team strategy ──
   if (onBidTeam) {
-    // Try to win valuable tricks
     if (inSuit.length > 0) {
-      if (weAreWinning && worthFighting) {
-        // Partner winning a count trick — play low to not waste
-        return inSuit.reduce((w, t) => tileInSuitStrength(t, ledSuit) < tileInSuitStrength(w, ledSuit) ? t : w, inSuit[0]);
+      if (partnerWinning) {
+        if (trickHasCount) {
+          // Partner winning a count trick — throw our own count if we have it, else lowest
+          const myCount = inSuit.filter(t => tileScore(t) > 0);
+          if (myCount.length > 0) return highest(myCount); // add more count to the pile
+          return lowest(inSuit.map(t => ({t, s: sStr(t)})).sort((a,b)=>a.s-b.s)).t || lowest(inSuit);
+        }
+        // Partner winning no-count — play lowest to save good tiles
+        return lowest(inSuit.map(t=>t).sort((a,b)=>sStr(a)-sStr(b)))[0] || lowest(inSuit);
       }
-      if (!weAreWinning && worthFighting) {
-        // Try to beat current winner
-        const canWin = inSuit.filter(t => tileInSuitStrength(t, ledSuit) > tileInSuitStrength(trick[trick.length-1].tile, ledSuit));
-        if (canWin.length > 0) return canWin.reduce((w, t) => tileInSuitStrength(t, ledSuit) > tileInSuitStrength(w, ledSuit) ? t : w, canWin[0]);
+      // Opponent winning — try to beat them
+      if (inSuitWinners.length > 0) {
+        return inSuitWinners.reduce((w,t)=>(sStr(t)<sStr(w)?t:w), inSuitWinners[0]); // lowest winner
       }
-      // Play lowest in suit
-      return inSuit.reduce((w, t) => tileInSuitStrength(t, ledSuit) < tileInSuitStrength(w, ledSuit) ? t : w, inSuit[0]);
+      // Can't beat in suit — play lowest
+      return inSuit.reduce((w,t)=>(sStr(t)<sStr(w)?t:w), inSuit[0]);
     }
-    if (!weAreWinning && worthFighting && trumpInHand.length > 0) {
-      // Trump in to win count tile
-      return trumpInHand.reduce((w, t) => tileStrength(t) < tileStrength(w) ? t : w, trumpInHand[0]);
-    }
-    // Discard lowest off-suit non-count tile
-    const dump = (offSuit.length > 0 ? offSuit : legal).filter(t => tileScore(t) === 0);
-    if (dump.length > 0) return dump.reduce((w, t) => tileStrength(t) < tileStrength(w) ? t : w, dump[0]);
-    return legal.reduce((w, t) => tileStrength(t) < tileStrength(w) ? t : w, legal[0]);
-  } else {
-    // Defense — try to win tricks away from bidding team
-    if (inSuit.length > 0) {
-      if (!weAreWinning) {
-        // Try to beat
-        const canWin = inSuit.filter(t => tileInSuitStrength(t, ledSuit) > tileInSuitStrength(trick[trick.length-1].tile, ledSuit));
-        if (canWin.length > 0) return canWin.reduce((w, t) => tileInSuitStrength(t, ledSuit) > tileInSuitStrength(w, ledSuit) ? t : w, canWin[0]);
+
+    // Can't follow suit — consider trumping
+    if (myTrumps.length > 0) {
+      if (opponentWinning) {
+        // Trump in — especially good if trick has count
+        return lowest(myTrumps); // use lowest trump to win
       }
-      // Play low
-      return inSuit.reduce((w, t) => tileInSuitStrength(t, ledSuit) < tileInSuitStrength(w, ledSuit) ? t : w, inSuit[0]);
+      if (partnerWinning && trickHasCount) {
+        // Partner winning count trick — no need to trump, throw garbage
+        return dump(offSuit.length > 0 ? offSuit : legal);
+      }
+      // Partner winning no count — still no need to trump, dump lowest
+      return dump(legal);
     }
-    // Discard lowest non-count
-    const dump = legal.filter(t => tileScore(t) === 0);
-    if (dump.length > 0) return dump.reduce((w, t) => tileStrength(t) < tileStrength(w) ? t : w, dump[0]);
-    return legal.reduce((w, t) => tileStrength(t) < tileStrength(w) ? t : w, legal[0]);
+
+    // No trump, no suit — dump lowest non-count, or count onto partner's winning trick
+    if (partnerWinning && trickHasCount) {
+      const myCount = legal.filter(t => tileScore(t) > 0);
+      if (myCount.length > 0) return highest(myCount); // pitch count to partner
+    }
+    return dump(legal);
   }
+
+  // ── Defense strategy ──
+  if (inSuit.length > 0) {
+    if (opponentWinning) {
+      // Try to beat the bidding team
+      if (inSuitWinners.length > 0) {
+        return inSuitWinners.reduce((w,t)=>(sStr(t)<sStr(w)?t:w), inSuitWinners[0]); // lowest winner
+      }
+    }
+    if (partnerWinning && trickHasCount) {
+      // Defensive partner winning — pitch count onto them
+      const myCount = inSuit.filter(t => tileScore(t) > 0);
+      if (myCount.length > 0) return highest(myCount);
+    }
+    return inSuit.reduce((w,t)=>(sStr(t)<sStr(w)?t:w), inSuit[0]);
+  }
+
+  // Can't follow suit — consider trumping
+  if (myTrumps.length > 0 && opponentWinning) {
+    // Trump in to steal the trick from the bidding team
+    return lowest(myTrumps);
+  }
+  if (partnerWinning && trickHasCount) {
+    // Defensive partner winning count — pitch our count to them
+    const myCount = legal.filter(t => tileScore(t) > 0);
+    if (myCount.length > 0) return highest(myCount);
+  }
+
+  // Last resort: dump lowest non-count tile
+  return dump(legal);
 }
 
 // ── Trigger bot actions ───────────────────────────────────────────────────────
