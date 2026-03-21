@@ -3,18 +3,15 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-const path = require('path');
 
 // ─── Game Logic ───────────────────────────────────────────────────────────────
 
 function makeDominoes() {
   const tiles = [];
-  for (let hi = 0; hi <= 6; hi++) {
-    for (let lo = 0; lo <= hi; lo++) {
+  for (let hi = 0; hi <= 6; hi++)
+    for (let lo = 0; lo <= hi; lo++)
       tiles.push({ hi, lo, id: `${hi}-${lo}` });
-    }
-  }
-  return tiles;
+  return tiles; // 28 tiles
 }
 
 function shuffle(arr) {
@@ -28,137 +25,910 @@ function shuffle(arr) {
 
 function deal() {
   const tiles = shuffle(makeDominoes());
-  return [
-    tiles.slice(0, 7),
-    tiles.slice(7, 14),
-    tiles.slice(14, 21),
-    tiles.slice(21, 28),
-  ];
+  return [tiles.slice(0,7), tiles.slice(7,14), tiles.slice(14,21), tiles.slice(21,28)];
 }
 
 function tileScore(tile) {
-  const sum = tile.hi + tile.lo;
-  return (sum === 5 || sum === 10) ? sum : 0;
+  const s = tile.hi + tile.lo;
+  return (s === 5 || s === 10) ? s : 0;
 }
 
+// Is this tile a trump? trump is a suit number 0-6, or null for no trump
 function isTrump(tile, trump) {
-  if (trump === null) return false;
+  if (trump === null || trump === undefined) return false;
   return tile.hi === trump || tile.lo === trump;
 }
 
-function trickWinner(plays, trump) {
-  const lead = plays[0];
-  const ledValue = (() => {
-    if (isTrump(lead.tile, trump)) return 'trump';
-    if (lead.tile.hi === trump) return lead.tile.lo;
-    return lead.tile.hi;
-  })();
+// The "suit" of a led tile for follow-suit purposes (non-trump context)
+// For non-doubles: higher end. For doubles: that number.
+function leadSuitOf(tile, trump) {
+  if (isTrump(tile, trump)) return trump; // trump suit
+  return tile.hi; // higher end is always hi (hi >= lo by construction)
+}
 
-  let winner = lead;
-  let winnerIsTrump = isTrump(lead.tile, trump);
+// Does a tile follow the led suit?
+function followsSuit(tile, leadSuit, trump) {
+  if (isTrump(tile, trump)) return false; // trump tiles don't follow non-trump suit
+  return tile.hi === leadSuit || tile.lo === leadSuit;
+}
+
+// In Follow Me, trump for a trick = high side of lead tile
+function followMeTrump(leadTile) {
+  return leadTile.hi; // hi >= lo always
+}
+
+// Determine trick winner
+// plays = [{seatIndex, tile}, ...], first is the lead
+// trump = suit number or null
+function trickWinner(plays, trump) {
+  const leadTile = plays[0].tile;
+  const effectiveTrump = trump; // may be null for low hands
+
+  // led suit (for non-trump following)
+  const ledSuit = leadSuitOf(leadTile, effectiveTrump);
+
+  let best = plays[0];
+  let bestIsTrump = isTrump(leadTile, effectiveTrump);
 
   for (let i = 1; i < plays.length; i++) {
     const p = plays[i];
-    const pTrump = isTrump(p.tile, trump);
+    const pTrump = isTrump(p.tile, effectiveTrump);
 
-    if (pTrump && !winnerIsTrump) {
-      winner = p;
-      winnerIsTrump = true;
-    } else if (pTrump && winnerIsTrump) {
-      const wPip = Math.max(winner.tile.hi, winner.tile.lo);
+    if (pTrump && !bestIsTrump) {
+      best = p; bestIsTrump = true;
+    } else if (pTrump && bestIsTrump) {
+      // Both trump: higher pip wins (hi end for non-doubles, same number for doubles)
+      const bestPip = Math.max(best.tile.hi, best.tile.lo);
       const pPip = Math.max(p.tile.hi, p.tile.lo);
-      if (pPip > wPip) winner = p;
-    } else if (!pTrump && !winnerIsTrump) {
-      const pSuit = p.tile.hi === trump ? p.tile.lo : p.tile.hi;
-      if (pSuit === ledValue) {
-        const wPip = Math.max(winner.tile.hi, winner.tile.lo);
+      if (pPip > bestPip) best = p;
+    } else if (!pTrump && !bestIsTrump) {
+      // Both non-trump: must match led suit to challenge
+      const pSuit = followsSuit(p.tile, ledSuit, effectiveTrump);
+      const bestSuit = followsSuit(best.tile, ledSuit, effectiveTrump) || leadSuitOf(best.tile, effectiveTrump) === ledSuit;
+      if (pSuit && bestSuit) {
+        const bestPip = Math.max(best.tile.hi, best.tile.lo);
         const pPip = Math.max(p.tile.hi, p.tile.lo);
-        if (pPip > wPip) winner = p;
+        if (pPip > bestPip) best = p;
+      } else if (pSuit && !bestSuit) {
+        best = p;
       }
     }
   }
-  return winner.seatIndex;
+  return best.seatIndex;
 }
 
-function validBidsFor(highBid, seatIndex, hand) {
-  const bids = [];
-  for (let b = 30; b <= 42; b++) {
-    if (b > (highBid.amount || 29) && !highBid.special) {
-      bids.push({ amount: b, special: null, label: String(b) });
-    }
-  }
-  const doubles = [84, 126, 168, 210];
-  for (const d of doubles) {
-    if (d > (highBid.amount || 0) && !highBid.special) {
-      bids.push({ amount: d, special: null, label: String(d) });
-    }
-  }
-  if (!highBid.special) {
-    bids.push({ amount: 42, special: 'low', label: 'Low' });
-  }
-  const doubleCount = hand.filter(t => t.hi === t.lo).length;
-  if (doubleCount >= 4 && !highBid.special && (highBid.amount || 0) < 42) {
-    bids.push({ amount: 84, special: 'plunge', label: 'Plunge' });
-  }
-  bids.push({ amount: 42, special: 'follow_me', label: 'Follow Me' });
-  bids.push({ amount: 0, special: 'pass', label: 'Pass' });
-  return bids;
+// Follow-suit validation: returns true if tile is a legal play
+function isLegalPlay(tile, hand, trick, trump, bidType, sittingOut) {
+  if (trick.length === 0) return true; // leading — any tile is fine
+  const leadTile = trick[0].tile;
+  const effectiveTrump = (bidType === 'follow_me') ? followMeTrump(leadTile) : trump;
+  const leadSuit = leadSuitOf(leadTile, effectiveTrump);
+  const leadIsTrump = isTrump(leadTile, effectiveTrump);
+
+  // Can I follow?
+  const canFollow = hand.some(t => {
+    if (leadIsTrump) return isTrump(t, effectiveTrump);
+    return followsSuit(t, leadSuit, effectiveTrump);
+  });
+
+  if (!canFollow) return true; // can't follow — play anything
+
+  if (leadIsTrump) return isTrump(tile, effectiveTrump);
+  return followsSuit(tile, leadSuit, effectiveTrump);
 }
 
+// Score a completed hand
+// Returns marks delta {0: n, 1: n}
 function scoreHand(bid, trickCount, pointsTaken) {
   const bidTeam = bid.seatIndex % 2;
   const defTeam = 1 - bidTeam;
 
-  const bt0 = bidTeam === 0 ? 0 : 1;
-  const bt1 = bidTeam === 0 ? 2 : 3;
-  const bidTeamTricks = trickCount[bt0] + trickCount[bt1];
-  const bidTeamPoints = pointsTaken[bt0] + pointsTaken[bt1];
+  // Team totals (seats 0&2 = team 0, seats 1&3 = team 1)
+  const teamTricks = [trickCount[0]+trickCount[2], trickCount[1]+trickCount[3]];
+  const teamPoints = [pointsTaken[0]+pointsTaken[2], pointsTaken[1]+pointsTaken[3]];
 
-  let delta = { 0: 0, 1: 0 };
+  const bidTeamTricks = teamTricks[bidTeam];
+  const bidTeamPts   = teamPoints[bidTeam];
+  const bidTeamTotal = bidTeamTricks + bidTeamPts;
 
-  if (bid.special === 'plunge') {
+  let delta = {0:0, 1:0};
+
+  if (bid.type === 'plunge') {
+    const marks = bid.plungeLevel || 2; // 2 base, +1 each re-bid
     const won = bidTeamTricks === 7;
-    delta[won ? bidTeam : defTeam] = 4;
+    delta[won ? bidTeam : defTeam] = marks;
     return delta;
   }
 
-  if (bid.special === 'follow_me') {
-    const won = bidTeamPoints + bidTeamTricks >= 42;
-    delta[won ? bidTeam : defTeam] = 1;
+  if (bid.type === 'low') {
+    // Bidder must take ZERO tricks
+    const won = bidTeamTricks === 0;
+    const marks = bid.marks || 1;
+    delta[won ? bidTeam : defTeam] = marks;
     return delta;
   }
 
-  if (bid.special === 'low') {
-    const bidTeamTotal = bidTeamPoints + bidTeamTricks;
-    const defTeamTotal = 42 - bidTeamTotal;
-    const won = bidTeamTotal < defTeamTotal;
-    delta[won ? bidTeam : defTeam] = 1;
-    return delta;
-  }
-
-  const bidScore = bidTeamPoints + bidTeamTricks;
-  const won = bidScore >= bid.amount;
-
-  let marks = 1;
-  if (bid.amount === 84)  marks = 2;
-  if (bid.amount === 126) marks = 3;
-  if (bid.amount === 168) marks = 4;
-  if (bid.amount === 210) marks = 5;
-  if (bid.amount === 42 && won && bidTeamTricks === 7) marks = 2;
-
+  // High (normal, double chain, follow_me)
+  const marks = bid.marks || 1;
+  const won = bidTeamTotal >= bid.amount;
   delta[won ? bidTeam : defTeam] = marks;
   return delta;
 }
 
-// ─── Express + Socket.io setup ────────────────────────────────────────────────
+// ─── Bidding helpers ──────────────────────────────────────────────────────────
+
+// Build available bids for the current bidder given game state
+// highBid = current winning bid object or null
+// hand = current player's tiles
+// allBids = all bids placed so far
+function getAvailableBids(highBid, hand, allBids) {
+  const bids = [];
+  const hAmount  = highBid ? highBid.amount : 0;
+  const hType    = highBid ? highBid.type   : null;
+
+  const any42Bid   = allBids.some(b => b.amount === 42);
+  const any42Low   = allBids.some(b => b.amount === 42 && b.type === 'low');
+  const any84Bid   = allBids.some(b => b.amount >= 84);
+  const doubleCount = hand.filter(t => t.hi === t.lo).length;
+
+  // ── Standard high bids 30-42 ──
+  for (let n = 30; n <= 42; n++) {
+    const available = hAmount < n; // beats current
+    bids.push({ amount: n, type: 'high', label: String(n), enabled: available });
+  }
+
+  // ── Low 42 ──
+  // Available if no one has bid 42+ yet, OR current high is less than 42
+  // Only one 42-level bid can be active at a time
+  const lowEnabled = hAmount < 42 || (hAmount === 42 && hType !== 'low');
+  bids.push({ amount: 42, type: 'low', label: '42 Low', enabled: lowEnabled && hAmount <= 42 && hType !== 'low' });
+
+  // ── 84 High ──
+  // Always available as a bid (beats anything up to 84)
+  bids.push({ amount: 84, type: 'high', label: '84 High', enabled: hAmount < 84, marks: 2 });
+
+  // ── 84 Low ──
+  // Only available if someone has already bid 42 (high or low)
+  bids.push({ amount: 84, type: 'low', label: '84 Low', enabled: any42Bid && hAmount < 84, marks: 2 });
+
+  // ── Plunge ──
+  // Available if player has 4+ doubles. Starts at 2 marks, +1 per re-bid
+  const plungeAlreadyBid = allBids.filter(b => b.type === 'plunge').length;
+  const plungeMarks = 2 + plungeAlreadyBid;
+  const plungeEnabled = doubleCount >= 4 && hAmount < 84;
+  bids.push({ amount: 84, type: 'plunge', label: `Plunge (${plungeMarks} marks)`, enabled: plungeEnabled, marks: plungeMarks, plungeLevel: plungeMarks });
+
+  // ── Doubling chain: 126, 168, 210 ──
+  // Only available after an 84 bid exists. Each can be high, low, or plunge.
+  if (any84Bid) {
+    const chainLevels = [
+      { amount: 126, label: '126', marks: 3 },
+      { amount: 168, label: '168', marks: 4 },
+      { amount: 210, label: '210', marks: 5 },
+    ];
+    for (const cl of chainLevels) {
+      bids.push({ amount: cl.amount, type: 'high',   label: cl.label+' High',   enabled: hAmount < cl.amount, marks: cl.marks });
+      bids.push({ amount: cl.amount, type: 'low',    label: cl.label+' Low',    enabled: hAmount < cl.amount, marks: cl.marks });
+      const plunge126Level = allBids.filter(b => b.type === 'plunge').length + (plungeAlreadyBid > 0 ? 0 : 0);
+      bids.push({ amount: cl.amount, type: 'plunge', label: cl.label+' Plunge', enabled: doubleCount >= 4 && hAmount < cl.amount, marks: cl.marks, plungeLevel: cl.marks });
+    }
+  }
+
+  // ── Pass ──
+  bids.push({ amount: 0, type: 'pass', label: 'Pass', enabled: true });
+
+  return bids;
+}
+
+// ─── HTML Page (inlined) ──────────────────────────────────────────────────────
+
+const CSS = `
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --felt:#1a5c38;--felt-dark:#123e27;--felt-light:#246b43;--felt-edge:#0d2e1a;
+  --ivory:#f5f0e8;--pip:#1a1a1a;--gold:#c9a84c;--gold-light:#e8c96a;
+  --text-main:#f5f0e8;--text-dim:rgba(245,240,232,.6);
+  --card-bg:rgba(10,30,18,.88);--card-border:rgba(201,168,76,.25);
+  --radius:12px;--tile-w:52px;--tile-h:96px;
+  font-family:'DM Sans',sans-serif;
+}
+html,body{height:100%;overflow:hidden}
+body{background:var(--felt-dark);color:var(--text-main);display:flex;align-items:center;justify-content:center}
+.screen{display:none;width:100%;height:100%}
+.screen.active{display:flex;align-items:center;justify-content:center}
+#screen-game.active{display:flex;flex-direction:column}
+
+/* Lobby */
+.lobby-card,.waiting-card{
+  background:var(--card-bg);border:1px solid var(--card-border);border-radius:var(--radius);
+  padding:2.5rem 2.5rem 2rem;width:min(420px,92vw);display:flex;flex-direction:column;gap:1.2rem;
+  backdrop-filter:blur(12px)
+}
+h1{font-family:'Playfair Display',serif;font-size:2.8rem;color:var(--gold);text-align:center;letter-spacing:.04em;line-height:1}
+h2{font-family:'Playfair Display',serif;font-size:1.6rem;color:var(--gold);text-align:center}
+.subtitle{text-align:center;color:var(--text-dim);font-size:.9rem}
+input[type="text"]{
+  width:100%;background:rgba(255,255,255,.07);border:1px solid rgba(201,168,76,.3);
+  border-radius:8px;color:var(--ivory);padding:.7rem 1rem;font-size:1rem;font-family:inherit;
+  outline:none;transition:border-color .2s
+}
+input[type="text"]:focus{border-color:var(--gold)}
+input[type="text"]::placeholder{color:var(--text-dim)}
+.lobby-actions{display:flex;flex-direction:column;gap:.8rem}
+.join-row{display:flex;gap:.6rem}
+.join-row input{flex:1;text-transform:uppercase;letter-spacing:.12em}
+.btn-primary{
+  background:var(--gold);color:#1a1a1a;border:none;border-radius:8px;padding:.75rem 1.4rem;
+  font-size:.95rem;font-weight:600;font-family:inherit;cursor:pointer;width:100%;transition:background .15s,transform .1s
+}
+.btn-primary:hover{background:var(--gold-light)}
+.btn-primary:active{transform:scale(.98)}
+.btn-secondary{
+  background:transparent;color:var(--gold);border:1px solid var(--gold);border-radius:8px;
+  padding:.75rem 1.2rem;font-size:.95rem;font-weight:500;font-family:inherit;cursor:pointer;
+  white-space:nowrap;transition:background .15s
+}
+.btn-secondary:hover{background:rgba(201,168,76,.12)}
+.error-msg{color:#e07070;font-size:.85rem;min-height:1.2em;text-align:center}
+
+/* Waiting */
+.room-code-display{
+  text-align:center;font-size:1.6rem;font-family:'Playfair Display',serif;color:var(--gold);
+  letter-spacing:.18em;display:flex;align-items:center;justify-content:center;gap:.5rem
+}
+.btn-copy{background:none;border:1px solid var(--card-border);color:var(--gold);border-radius:6px;padding:.2rem .5rem;font-size:.9rem;cursor:pointer}
+.btn-copy:hover{background:rgba(201,168,76,.1)}
+.seat-list{display:flex;flex-direction:column;gap:.5rem}
+.seat-row{
+  display:flex;align-items:center;gap:.8rem;padding:.6rem .9rem;
+  background:rgba(255,255,255,.05);border-radius:8px;border:1px solid rgba(255,255,255,.08)
+}
+.seat-row .seat-num{color:var(--gold);font-weight:600;min-width:24px}
+.seat-row .seat-team{font-size:.75rem;color:var(--text-dim);margin-left:auto}
+.seat-row.empty{opacity:.45;font-style:italic}
+.waiting-hint{text-align:center;font-size:.82rem;color:var(--text-dim)}
+
+/* Score bar */
+.score-bar{
+  display:flex;align-items:center;justify-content:space-between;
+  background:var(--felt-edge);border-bottom:1px solid rgba(201,168,76,.2);
+  padding:.5rem 1.2rem;flex-shrink:0;z-index:10
+}
+.score-team{display:flex;align-items:center;gap:.5rem}
+.score-team.right{flex-direction:row-reverse}
+.team-label{font-size:.75rem;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em}
+.team-marks{font-family:'Playfair Display',serif;font-size:1.8rem;color:var(--gold);line-height:1;min-width:2ch;text-align:center}
+.team-pip{font-size:.7rem;color:var(--text-dim)}
+.score-center{display:flex;flex-direction:column;align-items:center;gap:.15rem}
+#game-status-label{font-size:.82rem;color:var(--text-dim)}
+.room-tag{font-size:.7rem;color:rgba(201,168,76,.5);letter-spacing:.12em}
+
+/* Trump banner */
+#trump-banner{
+  background:rgba(13,46,26,.9);border-bottom:1px solid rgba(201,168,76,.3);
+  padding:.3rem 1rem;text-align:center;font-size:.82rem;color:var(--gold);
+  letter-spacing:.05em;flex-shrink:0;display:none
+}
+#trump-banner.visible{display:block}
+
+/* Table */
+.table-wrap{
+  flex:1;position:relative;display:grid;
+  grid-template-areas:". top ." "left center right" ". bottom .";
+  grid-template-columns:130px 1fr 130px;grid-template-rows:110px 1fr 150px;
+  gap:4px;padding:8px;overflow:hidden
+}
+.player-zone{display:flex;align-items:center;justify-content:center;position:relative}
+.player-zone.top{grid-area:top;flex-direction:column;gap:4px}
+.player-zone.left{grid-area:left;flex-direction:column;gap:4px}
+.player-zone.right{grid-area:right;flex-direction:column;gap:4px}
+.player-zone.bottom{grid-area:bottom;flex-direction:column;gap:6px}
+.player-name-tag{
+  font-size:.78rem;font-weight:500;color:var(--text-dim);background:rgba(0,0,0,.3);
+  border:1px solid rgba(201,168,76,.15);border-radius:20px;padding:.2rem .7rem;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:110px
+}
+.player-name-tag.active-player{color:var(--gold);border-color:rgba(201,168,76,.5)}
+.player-name-tag.sitting-out{color:#e07070;border-color:rgba(220,100,100,.3);text-decoration:line-through}
+.opponent-hand{display:flex;gap:3px;align-items:center;justify-content:center;flex-wrap:nowrap}
+.opponent-hand.vertical{flex-direction:column}
+
+/* Tiles */
+.tile{
+  width:var(--tile-w);height:var(--tile-h);background:var(--ivory);border-radius:6px;
+  border:1px solid #ccc;display:flex;flex-direction:column;align-items:center;
+  justify-content:space-between;padding:5px;cursor:default;position:relative;flex-shrink:0;
+  user-select:none;box-shadow:0 2px 6px rgba(0,0,0,.4);transition:transform .12s,box-shadow .12s
+}
+.tile.playable{cursor:pointer;border-color:var(--gold)}
+.tile.playable:hover{transform:translateY(-10px);box-shadow:0 10px 24px rgba(0,0,0,.5)}
+.tile.playable:active{transform:translateY(-5px)}
+.tile.illegal{opacity:.4;cursor:not-allowed}
+.tile.trump-tile{border-color:#c0392b;box-shadow:0 0 0 2px rgba(192,57,43,.4),0 2px 6px rgba(0,0,0,.4)}
+.tile .half{width:100%;display:flex;align-items:center;justify-content:center;flex:1}
+.tile .divider{width:80%;height:1px;background:#bbb;flex-shrink:0}
+.tile-back{background:var(--felt);border:1px solid rgba(201,168,76,.3);width:28px;height:52px;border-radius:4px;flex-shrink:0}
+.pips{display:grid;gap:3px;align-items:center;justify-items:center;padding:2px}
+.pip{width:8px;height:8px;background:var(--pip);border-radius:50%}
+.pips[data-n="0"]{grid-template-columns:1fr;min-height:24px}
+.pips[data-n="1"]{grid-template-columns:1fr}
+.pips[data-n="2"]{grid-template-columns:1fr 1fr}
+.pips[data-n="3"]{grid-template-columns:1fr 1fr 1fr}
+.pips[data-n="4"]{grid-template-columns:1fr 1fr}
+.pips[data-n="5"]{grid-template-columns:1fr 1fr 1fr}
+.pips[data-n="6"]{grid-template-columns:1fr 1fr 1fr}
+
+/* Trick area */
+.trick-area{grid-area:center;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px}
+.trick-row{display:flex;align-items:center;gap:8px}
+.trick-slot{width:var(--tile-w);height:var(--tile-h);display:flex;align-items:center;justify-content:center}
+.trick-center-info{display:flex;flex-direction:column;align-items:center;justify-content:center;min-width:60px;gap:4px}
+.tile.trick-winner{box-shadow:0 0 0 3px var(--gold),0 4px 12px rgba(0,0,0,.5)}
+
+/* My hand */
+.my-hand{
+  display:flex;gap:6px;align-items:flex-end;justify-content:center;flex-wrap:nowrap;
+  overflow-x:auto;padding:4px 4px 0;max-width:100%
+}
+
+/* Overlays */
+.overlay{
+  position:absolute;inset:0;display:flex;align-items:flex-end;justify-content:center;
+  background:rgba(0,0,0,.4);z-index:100;padding-bottom:8px
+}
+.overlay.hidden{display:none}
+.overlay-card{
+  background:#0e2c1a;border:1px solid var(--card-border);border-radius:var(--radius) var(--radius) 0 0;
+  padding:1rem 1.2rem 1.2rem;width:100%;max-width:100%;display:flex;flex-direction:column;gap:.8rem;
+  max-height:60vh;overflow-y:auto
+}
+.overlay-card h3{font-family:'Playfair Display',serif;color:var(--gold);font-size:1.2rem;text-align:center}
+.overlay-full{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.55);backdrop-filter:blur(4px);z-index:100}
+.overlay-full.hidden{display:none}
+.overlay-full-card{
+  background:#0e2c1a;border:1px solid var(--card-border);border-radius:var(--radius);
+  padding:1.8rem 2rem;min-width:300px;max-width:min(480px,92vw);display:flex;flex-direction:column;gap:1rem
+}
+.overlay-full-card h3{font-family:'Playfair Display',serif;color:var(--gold);font-size:1.4rem;text-align:center}
+.bid-subtitle{text-align:center;font-size:.82rem;color:var(--text-dim)}
+
+/* Bid panel (bottom sheet, collapsible) */
+#bid-sheet{position:absolute;bottom:0;left:0;right:0;z-index:200;transition:transform .25s}
+#bid-sheet.hidden{display:none}
+.bid-sheet-handle{
+  background:#0e2c1a;border:1px solid var(--card-border);border-radius:var(--radius) var(--radius) 0 0;
+  padding:.5rem 1.2rem;display:flex;align-items:center;justify-content:space-between;cursor:pointer
+}
+.bid-sheet-handle h3{font-family:'Playfair Display',serif;color:var(--gold);font-size:1rem;margin:0}
+.bid-sheet-toggle{background:none;border:none;color:var(--gold);font-size:1.2rem;cursor:pointer;line-height:1}
+.bid-sheet-body{
+  background:#0b2217;border:1px solid var(--card-border);border-top:none;
+  padding:.8rem 1rem 1rem;max-height:42vh;overflow-y:auto
+}
+.bid-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(100px,1fr));gap:6px}
+.bid-btn{
+  background:rgba(255,255,255,.06);border:1px solid rgba(201,168,76,.25);border-radius:8px;
+  color:var(--ivory);padding:.5rem .4rem;font-family:inherit;font-size:.82rem;font-weight:500;
+  cursor:pointer;transition:background .12s,border-color .12s;text-align:center
+}
+.bid-btn:hover:not(:disabled){background:rgba(201,168,76,.18);border-color:var(--gold)}
+.bid-btn.special{color:var(--gold);border-color:rgba(201,168,76,.5)}
+.bid-btn.pass-btn{color:#e07070;border-color:rgba(220,100,100,.3)}
+.bid-btn.double-btn{color:#8ecdf5;border-color:rgba(100,180,240,.3)}
+.bid-btn.low-btn{color:#a8e6cf;border-color:rgba(100,220,170,.3)}
+.bid-btn:disabled{opacity:.28;cursor:not-allowed;pointer-events:none}
+
+/* Trump select */
+.trump-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+.trump-btn{
+  display:flex;flex-direction:column;align-items:center;gap:.3rem;
+  background:rgba(255,255,255,.06);border:1px solid rgba(201,168,76,.25);border-radius:10px;
+  color:var(--ivory);padding:.9rem .5rem;cursor:pointer;font-family:inherit;font-size:.8rem;transition:background .12s
+}
+.trump-btn:hover{background:rgba(201,168,76,.18);border-color:var(--gold)}
+.trump-btn.follow-me-btn{grid-column:span 2;border-color:rgba(100,180,240,.4);color:#8ecdf5}
+.trump-pip-preview{
+  width:22px;height:22px;background:var(--pip);border-radius:50%;
+  display:flex;align-items:center;justify-content:center;color:var(--ivory);font-size:.75rem;font-weight:600
+}
+
+/* Result card */
+.result-made{color:#6fcf97}
+.result-set{color:#eb5757}
+#result-body,#gameover-body{font-size:.9rem;color:var(--text-dim);line-height:1.7;text-align:center}
+
+/* Boneyard panel */
+#boneyard-panel{
+  position:absolute;left:0;top:50%;transform:translateY(-50%);z-index:50;
+  display:flex;flex-direction:column;align-items:flex-start
+}
+.boneyard-tab{
+  background:rgba(13,46,26,.9);border:1px solid var(--card-border);
+  border-left:none;border-radius:0 8px 8px 0;padding:.4rem .6rem;
+  font-size:.72rem;color:var(--gold);cursor:pointer;writing-mode:vertical-rl;
+  text-orientation:mixed;letter-spacing:.08em;user-select:none
+}
+.boneyard-tab:hover{background:rgba(201,168,76,.12)}
+#boneyard-content{
+  background:rgba(10,28,18,.95);border:1px solid var(--card-border);border-radius:0 8px 8px 0;
+  padding:.6rem;max-height:70vh;overflow-y:auto;min-width:220px;display:none
+}
+#boneyard-content.open{display:block}
+#boneyard-content h4{font-size:.75rem;color:var(--gold);margin-bottom:.5rem;letter-spacing:.06em}
+.boneyard-tiles{display:flex;flex-wrap:wrap;gap:3px}
+.boneyard-tile{
+  width:22px;height:40px;background:var(--ivory);border-radius:3px;border:1px solid #bbb;
+  display:flex;flex-direction:column;align-items:center;justify-content:space-between;
+  padding:2px;flex-shrink:0;font-size:7px;color:var(--pip);font-weight:600
+}
+.boneyard-tile span{line-height:1}
+.boneyard-tile .bd{width:90%;height:1px;background:#bbb;flex-shrink:0}
+.boneyard-empty{font-size:.75rem;color:var(--text-dim);font-style:italic}
+
+/* Dealer chip */
+.dealer-chip{
+  display:inline-block;background:var(--gold);color:#1a1a1a;font-size:.6rem;font-weight:700;
+  border-radius:50%;width:16px;height:16px;text-align:center;line-height:16px;margin-left:4px
+}
+.zone-active .player-name-tag{color:var(--gold);border-color:rgba(201,168,76,.6);background:rgba(201,168,76,.1)}
+
+@media(max-width:600px){
+  :root{--tile-w:38px;--tile-h:70px}
+  .table-wrap{grid-template-columns:80px 1fr 80px;grid-template-rows:85px 1fr 140px}
+  .tile-back{width:20px;height:36px}
+  .bid-grid{grid-template-columns:repeat(auto-fill,minmax(80px,1fr))}
+}
+`;
+
+const CLIENT_JS = `
+'use strict';
+const socket = io();
+let myName='',myRoom='',mySeat=-1,lastState=null;
+
+function showScreen(id){document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active'));document.getElementById(id).classList.add('active')}
+function showOverlay(id){document.getElementById(id).classList.remove('hidden')}
+function hideOverlay(id){document.getElementById(id).classList.add('hidden')}
+function hideAllOverlays(){['overlay-trump','overlay-hand-end','overlay-game-over'].forEach(hideOverlay);document.getElementById('bid-sheet').classList.add('hidden')}
+
+// Lobby
+document.getElementById('btn-create').addEventListener('click',()=>{
+  const name=document.getElementById('player-name').value.trim();
+  if(!name){setErr('lobby-error','Enter your name first');return}
+  myName=name;socket.emit('createRoom',{name})
+});
+document.getElementById('btn-join').addEventListener('click',()=>{
+  const name=document.getElementById('player-name').value.trim();
+  const code=document.getElementById('room-code-input').value.trim();
+  if(!name){setErr('lobby-error','Enter your name first');return}
+  if(!code){setErr('lobby-error','Enter a room code');return}
+  myName=name;socket.emit('joinRoom',{name,code})
+});
+document.getElementById('player-name').addEventListener('keydown',e=>{if(e.key==='Enter')document.getElementById('btn-create').click()});
+document.getElementById('room-code-input').addEventListener('keydown',e=>{if(e.key==='Enter')document.getElementById('btn-join').click()});
+document.getElementById('btn-copy-code').addEventListener('click',()=>{
+  navigator.clipboard.writeText(myRoom).then(()=>{
+    document.getElementById('btn-copy-code').textContent='✓';
+    setTimeout(()=>document.getElementById('btn-copy-code').textContent='⧉',1500)
+  })
+});
+document.getElementById('btn-start').addEventListener('click',()=>socket.emit('startGame'));
+document.getElementById('btn-next-hand').addEventListener('click',()=>{socket.emit('nextHand');hideOverlay('overlay-hand-end')});
+document.getElementById('btn-play-again').addEventListener('click',()=>location.reload());
+
+function setErr(id,msg){document.getElementById(id).textContent=msg}
+
+// Bid sheet collapse/expand
+let bidSheetOpen=true;
+document.getElementById('bid-sheet-toggle').addEventListener('click',()=>{
+  bidSheetOpen=!bidSheetOpen;
+  document.getElementById('bid-sheet-body').style.display=bidSheetOpen?'block':'none';
+  document.getElementById('bid-sheet-toggle').textContent=bidSheetOpen?'▼':'▲'
+});
+
+// Boneyard
+let boneyardOpen=false;
+document.getElementById('boneyard-tab').addEventListener('click',()=>{
+  boneyardOpen=!boneyardOpen;
+  document.getElementById('boneyard-content').classList.toggle('open',boneyardOpen)
+});
+
+socket.on('error',msg=>{
+  if(document.getElementById('screen-lobby').classList.contains('active'))setErr('lobby-error',msg);
+  else if(document.getElementById('screen-waiting').classList.contains('active'))setErr('waiting-error',msg);
+  else alert(msg)
+});
+
+socket.on('joined',({code,seat,name})=>{
+  myRoom=code;mySeat=seat;myName=name;
+  document.getElementById('display-code').textContent=code;
+  document.getElementById('score-room-code').textContent=code;
+  document.getElementById('btn-start').style.display=seat===0?'block':'none';
+  showScreen('screen-waiting');
+  sessionStorage.setItem('42-room',code);
+  sessionStorage.setItem('42-seat',seat);
+  sessionStorage.setItem('42-name',name)
+});
+
+socket.on('state',state=>{
+  lastState=state;
+  if(state.state==='lobby'){renderWaiting(state);if(!document.getElementById('screen-waiting').classList.contains('active'))showScreen('screen-waiting');return}
+  if(!document.getElementById('screen-game').classList.contains('active'))showScreen('screen-game');
+  renderGame(state)
+});
+
+function renderWaiting(state){
+  const list=document.getElementById('seat-list');list.innerHTML='';
+  const teams=['N/S','E/W','N/S','E/W'],positions=['North','East','South','West'];
+  state.seats.forEach((seat,i)=>{
+    const row=document.createElement('div');
+    row.className='seat-row'+(seat?'':' empty');
+    row.innerHTML='<span class="seat-num">'+(i+1)+'</span><span>'+(seat?(seat.disconnected?seat.name+' (away)':seat.name):'Empty')+'</span><span class="seat-team">'+positions[i]+' · '+teams[i]+'</span>';
+    list.appendChild(row)
+  })
+}
+
+const SUIT_NAMES=['Blanks','Ones','Twos','Threes','Fours','Fives','Sixes'];
+
+function seatOffset(s){return((s-mySeat+4)%4)}
+function posForOffset(o){return['bottom','left','top','right'][o]}
+
+function renderGame(state){
+  // Score
+  document.getElementById('marks-0').textContent=state.score[0];
+  document.getElementById('marks-1').textContent=state.score[1];
+
+  // Status label
+  const sl={bidding:'Bidding',trump_select:'Selecting trump',plunge_trump_select:'Partner selecting trump',playing:'Playing',hand_end:'Hand over',game_over:'Game over'};
+  document.getElementById('game-status-label').textContent=sl[state.state]||'';
+
+  // Trump banner
+  const banner=document.getElementById('trump-banner');
+  if(state.state==='playing'||state.state==='hand_end'){
+    if(state.bidType==='low'){
+      banner.textContent='42 LOW — No trump · Bidder must take zero tricks';banner.classList.add('visible')
+    } else if(state.bidType==='follow_me'){
+      const t=state.trickTrump!==null&&state.trickTrump!==undefined?'This trick trump: '+SUIT_NAMES[state.trickTrump]:'Follow Me — trump set by each lead';
+      banner.textContent=t;banner.classList.add('visible')
+    } else if(state.trump!==null&&state.trump!==undefined){
+      banner.textContent='Trump: '+SUIT_NAMES[state.trump];banner.classList.add('visible')
+    } else {
+      banner.classList.remove('visible')
+    }
+  } else {
+    banner.classList.remove('visible')
+  }
+
+  // Players
+  for(let s=0;s<4;s++){
+    const offset=seatOffset(s),pos=posForOffset(offset);
+    const nameEl=document.getElementById('name-'+pos);
+    const handEl=document.getElementById('hand-'+pos);
+    if(!nameEl||!handEl)continue;
+    const seat=state.seats[s];
+    let nameText=seat?seat.name:'Seat '+(s+1);
+    if(s===state.dealer)nameText+='<span class="dealer-chip">D</span>';
+    nameEl.innerHTML=nameText;
+    const isActive=(state.state==='playing'&&state.currentPlayer===s)||(state.state==='bidding'&&state.currentBidder===s)||((state.state==='trump_select'||state.state==='plunge_trump_select')&&state.trumpSelector===s);
+    nameEl.classList.toggle('active-player',isActive);
+    nameEl.classList.toggle('sitting-out',!!(state.sittingOut===s));
+    document.getElementById('zone-'+pos)?.classList.toggle('zone-active',isActive);
+    handEl.innerHTML='';
+    if(s===mySeat){
+      const myTurn=state.state==='playing'&&state.currentPlayer===mySeat&&state.sittingOut!==mySeat;
+      (state.myHand||[]).forEach(tile=>{
+        const el=renderTile(tile,state.trump,state.bidType,state.trickTrump);
+        if(myTurn){
+          const legal=isLegalPlayClient(tile,state.myHand,state.trick,state.trump,state.bidType,state.trickTrump);
+          if(legal){el.classList.add('playable');el.addEventListener('click',()=>socket.emit('playTile',{tileId:tile.id}))}
+          else el.classList.add('illegal')
+        }
+        handEl.appendChild(el)
+      })
+    } else {
+      const count=Math.max(0,7-state.trickCount.reduce((a,b)=>a+b,0));
+      for(let i=0;i<count;i++){const b=document.createElement('div');b.className='tile-back';handEl.appendChild(b)}
+    }
+  }
+
+  renderTrickArea(state);
+  renderBoneyard(state);
+  hideAllOverlays();
+
+  if(state.state==='bidding'&&state.currentBidder===mySeat){
+    renderBidSheet(state);document.getElementById('bid-sheet').classList.remove('hidden')
+  } else if((state.state==='trump_select')&&state.trumpSelector===mySeat){
+    renderTrumpOverlay(state);showOverlay('overlay-trump')
+  } else if(state.state==='plunge_trump_select'&&state.trumpSelector===mySeat){
+    renderTrumpOverlay(state);showOverlay('overlay-trump')
+  } else if(state.state==='hand_end'){
+    renderHandEnd(state);showOverlay('overlay-hand-end')
+  } else if(state.state==='game_over'){
+    renderGameOver(state);showOverlay('overlay-game-over')
+  }
+}
+
+function isLegalPlayClient(tile,hand,trick,trump,bidType,trickTrump){
+  if(trick.length===0)return true;
+  const leadTile=trick[0].tile;
+  const effectiveTrump=bidType==='follow_me'?trickTrump:trump;
+  if(effectiveTrump===null||effectiveTrump===undefined){
+    // No trump (low hand) — must follow high end suit
+    const ledSuit=leadTile.hi;
+    const canFollow=hand.some(t=>t.hi===ledSuit||t.lo===ledSuit);
+    if(!canFollow)return true;
+    return tile.hi===ledSuit||tile.lo===ledSuit
+  }
+  const leadIsTrump=leadTile.hi===effectiveTrump||leadTile.lo===effectiveTrump;
+  const ledSuit=leadIsTrump?effectiveTrump:leadTile.hi;
+  const tileIsTrump=tile.hi===effectiveTrump||tile.lo===effectiveTrump;
+  const canFollowTrump=hand.some(t=>t.hi===effectiveTrump||t.lo===effectiveTrump);
+  const canFollowSuit=hand.some(t=>(t.hi!==effectiveTrump&&t.lo!==effectiveTrump)&&(t.hi===ledSuit||t.lo===ledSuit));
+  if(leadIsTrump){if(!canFollowTrump)return true;return tileIsTrump}
+  if(!canFollowSuit)return true;
+  return !tileIsTrump&&(tile.hi===ledSuit||tile.lo===ledSuit)
+}
+
+function renderTile(tile,trump,bidType,trickTrump){
+  const el=document.createElement('div');el.className='tile';el.dataset.id=tile.id;
+  const effectiveTrump=bidType==='follow_me'?trickTrump:trump;
+  if(effectiveTrump!==null&&effectiveTrump!==undefined&&(tile.hi===effectiveTrump||tile.lo===effectiveTrump))el.classList.add('trump-tile');
+  const top=document.createElement('div');top.className='half';top.appendChild(makePips(tile.hi));
+  const div=document.createElement('div');div.className='divider';
+  const bot=document.createElement('div');bot.className='half';bot.appendChild(makePips(tile.lo));
+  el.appendChild(top);el.appendChild(div);el.appendChild(bot);
+  return el
+}
+
+const PIP_POS={0:[],1:[[1,1]],2:[[0,0],[2,2]],3:[[0,0],[1,1],[2,2]],4:[[0,0],[2,0],[0,2],[2,2]],5:[[0,0],[2,0],[1,1],[0,2],[2,2]],6:[[0,0],[2,0],[0,1],[2,1],[0,2],[2,2]]};
+function makePips(n){
+  const c=document.createElement('div');c.className='pips';c.dataset.n=n;
+  if(n===0)return c;
+  if(n<=2){PIP_POS[n].forEach(()=>{const p=document.createElement('div');p.className='pip';c.appendChild(p)});return c}
+  c.style.cssText='position:relative;width:28px;height:28px;';
+  PIP_POS[n].forEach(([col,row])=>{const p=document.createElement('div');p.className='pip';p.style.cssText='position:absolute;left:'+(col*10)+'px;top:'+(row*10)+'px;';c.appendChild(p)});
+  return c
+}
+
+function renderTrickArea(state){
+  const slots={bottom:document.getElementById('trick-bottom'),left:document.getElementById('trick-left'),top:document.getElementById('trick-top'),right:document.getElementById('trick-right')};
+  Object.values(slots).forEach(s=>s.innerHTML='');
+  state.trick.forEach(play=>{
+    const pos=posForOffset(seatOffset(play.seatIndex));
+    const slot=slots[pos];if(!slot)return;
+    const el=renderTile(play.tile,state.trump,state.bidType,state.trickTrump);
+    slot.appendChild(el)
+  })
+}
+
+function renderBoneyard(state){
+  const content=document.getElementById('boneyard-content');
+  content.innerHTML='<h4>Boneyard ('+( state.boneyard?state.boneyard.length:0)+' played)</h4>';
+  if(!state.boneyard||state.boneyard.length===0){content.innerHTML+='<p class="boneyard-empty">No tiles played yet</p>';return}
+  const wrap=document.createElement('div');wrap.className='boneyard-tiles';
+  state.boneyard.forEach(tile=>{
+    const el=document.createElement('div');el.className='boneyard-tile';
+    el.innerHTML='<span>'+tile.hi+'</span><div class="bd"></div><span>'+tile.lo+'</span>';
+    wrap.appendChild(el)
+  });
+  content.appendChild(wrap)
+}
+
+function renderBidSheet(state){
+  const grid=document.getElementById('bid-buttons');grid.innerHTML='';
+  const bids=state.availableBids||[];
+  const currentLabel=state.bid&&state.bid.amount>0?(state.bid.label||state.bid.amount):'None';
+  document.getElementById('bid-current-label').textContent='Current bid: '+currentLabel;
+  bids.forEach(bid=>{
+    const btn=document.createElement('button');
+    btn.className='bid-btn'+(bid.type==='pass'?' pass-btn':bid.type==='low'?' low-btn':bid.type==='plunge'?' special':bid.amount>=84?' double-btn':'');
+    btn.textContent=bid.label;
+    if(!bid.enabled)btn.disabled=true;
+    btn.addEventListener('click',()=>{
+      socket.emit('placeBid',{amount:bid.amount,type:bid.type,marks:bid.marks,plungeLevel:bid.plungeLevel});
+      document.getElementById('bid-sheet').classList.add('hidden')
+    });
+    grid.appendChild(btn)
+  })
+}
+
+function renderTrumpOverlay(state){
+  const grid=document.getElementById('trump-buttons');grid.innerHTML='';
+  const myHand=state.myHand||[];
+  const countPerSuit=Array(7).fill(0);
+  myHand.forEach(t=>{countPerSuit[t.hi]++;if(t.hi!==t.lo)countPerSuit[t.lo]++});
+  SUIT_NAMES.forEach((name,i)=>{
+    const btn=document.createElement('button');btn.className='trump-btn';
+    const preview=document.createElement('div');preview.className='trump-pip-preview';preview.textContent=i;
+    const label=document.createElement('span');label.textContent=name;
+    const count=document.createElement('span');count.style.cssText='font-size:.7rem;color:var(--gold)';count.textContent=countPerSuit[i]+' tiles';
+    btn.appendChild(preview);btn.appendChild(label);btn.appendChild(count);
+    btn.addEventListener('click',()=>{socket.emit('selectTrump',{trump:i});hideOverlay('overlay-trump')});
+    grid.appendChild(btn)
+  });
+  // Follow Me option only for normal high bids
+  if(state.bidType==='high'){
+    const fm=document.createElement('button');fm.className='trump-btn follow-me-btn';
+    fm.innerHTML='<span style="font-size:1rem">&#9733;</span><span>Follow Me</span><span style="font-size:.7rem;color:#8ecdf5">Lead sets trump</span>';
+    fm.addEventListener('click',()=>{socket.emit('selectTrump',{trump:-1,followMe:true});hideOverlay('overlay-trump')});
+    grid.appendChild(fm)
+  }
+  document.getElementById('trump-card-title').textContent=state.state==='plunge_trump_select'?'Partner: Pick Trump':'Select Trump'
+}
+
+function renderHandEnd(state){
+  const last=state.handHistory[state.handHistory.length-1];if(!last)return;
+  const bidTeamName=last.bidTeam===0?'N/S':'E/W';
+  document.getElementById('result-title').textContent=last.made?bidTeamName+' made it!':bidTeamName+' was set!';
+  const winTeam=last.delta[0]>0?'N/S':'E/W';
+  const marks=Math.max(last.delta[0],last.delta[1]);
+  document.getElementById('result-body').innerHTML='<p class="'+(last.made?'result-made':'result-set')+'">'+(last.made?'✓':'✗')+' Bid: '+last.bid.label+' · '+(last.made?'Made':'Set')+'</p><p style="margin-top:.5rem">'+winTeam+' gets '+marks+' mark'+(marks!==1?'s':'')+'</p><p style="margin-top:.5rem">Score — N/S: <strong>'+state.score[0]+'</strong> · E/W: <strong>'+state.score[1]+'</strong></p><p style="margin-top:.3rem;font-size:.78rem;color:var(--text-dim)">First to 7 marks wins</p>'
+}
+
+function renderGameOver(state){
+  const winner=state.score[0]>=7?'N/S':'E/W';
+  const myTeam=mySeat%2===0?'N/S':'E/W';
+  document.getElementById('gameover-title').textContent=winner===myTeam?'Your team wins!':winner+' wins!';
+  document.getElementById('gameover-body').innerHTML='<p>Final score</p><p style="font-size:1.3rem;color:var(--gold);margin:.5rem 0">N/S '+state.score[0]+' – '+state.score[1]+' E/W</p>'
+}
+
+socket.on('connect',()=>{
+  const code=sessionStorage.getItem('42-room');
+  const seat=sessionStorage.getItem('42-seat');
+  const name=sessionStorage.getItem('42-name');
+  if(code&&seat!==null&&name){mySeat=parseInt(seat);myRoom=code;myName=name;socket.emit('rejoin',{code,seat:parseInt(seat),name})}
+});
+`;
+
+function getHTML() {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Texas 42</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>${CSS}</style>
+</head>
+<body>
+
+<div id="screen-lobby" class="screen active">
+  <div class="lobby-card">
+    <h1>Texas&nbsp;42</h1>
+    <p class="subtitle">Classic dominoes for 4 players</p>
+    <input id="player-name" type="text" placeholder="Your name" maxlength="18" autocomplete="off">
+    <div class="lobby-actions">
+      <button id="btn-create" class="btn-primary">Create Game</button>
+      <div class="join-row">
+        <input id="room-code-input" type="text" placeholder="Room code" maxlength="4" autocomplete="off">
+        <button id="btn-join" class="btn-secondary">Join</button>
+      </div>
+    </div>
+    <p id="lobby-error" class="error-msg"></p>
+  </div>
+</div>
+
+<div id="screen-waiting" class="screen">
+  <div class="waiting-card">
+    <h2>Waiting for players</h2>
+    <div class="room-code-display">
+      Room: <span id="display-code">----</span>
+      <button id="btn-copy-code" class="btn-copy">&#x29C9;</button>
+    </div>
+    <div id="seat-list" class="seat-list"></div>
+    <p class="waiting-hint">Share the room code with your friends</p>
+    <button id="btn-start" class="btn-primary" style="display:none">Start Game</button>
+    <p id="waiting-error" class="error-msg"></p>
+  </div>
+</div>
+
+<div id="screen-game" class="screen">
+  <header class="score-bar">
+    <div class="score-team">
+      <span class="team-label">N/S</span>
+      <span class="team-marks" id="marks-0">0</span>
+      <span class="team-pip">marks</span>
+    </div>
+    <div class="score-center">
+      <span id="game-status-label"></span>
+      <span class="room-tag" id="score-room-code"></span>
+    </div>
+    <div class="score-team right">
+      <span class="team-pip">marks</span>
+      <span class="team-marks" id="marks-1">0</span>
+      <span class="team-label">E/W</span>
+    </div>
+  </header>
+
+  <div id="trump-banner"></div>
+
+  <div class="table-wrap">
+    <div class="player-zone top" id="zone-top">
+      <div class="player-name-tag" id="name-top"></div>
+      <div class="opponent-hand" id="hand-top"></div>
+    </div>
+    <div class="player-zone left" id="zone-left">
+      <div class="player-name-tag" id="name-left"></div>
+      <div class="opponent-hand vertical" id="hand-left"></div>
+    </div>
+    <div class="player-zone right" id="zone-right">
+      <div class="opponent-hand vertical" id="hand-right"></div>
+      <div class="player-name-tag" id="name-right"></div>
+    </div>
+    <div class="trick-area">
+      <div class="trick-slot" id="trick-top"></div>
+      <div class="trick-row">
+        <div class="trick-slot" id="trick-left"></div>
+        <div class="trick-center-info" id="trick-center-info"></div>
+        <div class="trick-slot" id="trick-right"></div>
+      </div>
+      <div class="trick-slot" id="trick-bottom"></div>
+    </div>
+    <div class="player-zone bottom" id="zone-bottom">
+      <div class="player-name-tag" id="name-bottom"></div>
+      <div class="my-hand" id="hand-bottom"></div>
+    </div>
+
+    <!-- Boneyard -->
+    <div id="boneyard-panel">
+      <div class="boneyard-tab" id="boneyard-tab">BONEYARD</div>
+      <div id="boneyard-content"></div>
+    </div>
+  </div>
+
+  <!-- Bid sheet (collapsible bottom panel) -->
+  <div id="bid-sheet" class="hidden">
+    <div class="bid-sheet-handle" onclick="document.getElementById('bid-sheet-toggle').click()">
+      <h3>Your Bid — <span id="bid-current-label" style="font-size:.85rem;font-weight:400"></span></h3>
+      <button class="bid-sheet-toggle" id="bid-sheet-toggle">&#9660;</button>
+    </div>
+    <div class="bid-sheet-body" id="bid-sheet-body">
+      <div class="bid-grid" id="bid-buttons"></div>
+    </div>
+  </div>
+
+  <!-- Trump select -->
+  <div id="overlay-trump" class="overlay-full hidden">
+    <div class="overlay-full-card">
+      <h3 id="trump-card-title">Select Trump</h3>
+      <p class="bid-subtitle">Choose the trump suit for this hand</p>
+      <div class="trump-grid" id="trump-buttons"></div>
+    </div>
+  </div>
+
+  <!-- Hand result -->
+  <div id="overlay-hand-end" class="overlay-full hidden">
+    <div class="overlay-full-card">
+      <h3 id="result-title"></h3>
+      <div id="result-body"></div>
+      <button id="btn-next-hand" class="btn-primary">Next Hand</button>
+    </div>
+  </div>
+
+  <!-- Game over -->
+  <div id="overlay-game-over" class="overlay-full hidden">
+    <div class="overlay-full-card">
+      <h3 id="gameover-title">Game Over</h3>
+      <div id="gameover-body"></div>
+      <button id="btn-play-again" class="btn-primary">Play Again</button>
+    </div>
+  </div>
+</div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script>${CLIENT_JS}</script>
+</body>
+</html>`;
+}
+
+// ─── Express + Socket.io ──────────────────────────────────────────────────────
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
-const PAGE_HTML = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"UTF-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n<title>Texas 42</title>\n<link rel=\"preconnect\" href=\"https://fonts.googleapis.com\">\n<link href=\"https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700&family=DM+Sans:wght@400;500;600&display=swap\" rel=\"stylesheet\">\n<style>\n/* \u2500\u2500 Reset & base \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }\n\n:root {\n  --felt:       #1a5c38;\n  --felt-dark:  #123e27;\n  --felt-light: #246b43;\n  --felt-edge:  #0d2e1a;\n  --ivory:      #f5f0e8;\n  --pip:        #1a1a1a;\n  --pip-accent: #c0392b;\n  --gold:       #c9a84c;\n  --gold-light: #e8c96a;\n  --text-main:  #f5f0e8;\n  --text-dim:   rgba(245,240,232,.6);\n  --card-bg:    rgba(10,30,18,.82);\n  --card-border:rgba(201,168,76,.25);\n  --radius:     12px;\n  --tile-w:     52px;\n  --tile-h:     96px;\n  --pip-sz:     8px;\n  font-family: 'DM Sans', sans-serif;\n}\n\nhtml, body { height: 100%; overflow: hidden; }\n\nbody {\n  background: var(--felt-dark);\n  color: var(--text-main);\n  display: flex;\n  align-items: center;\n  justify-content: center;\n}\n\n/* \u2500\u2500 Screens \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n.screen { display: none; width: 100%; height: 100%; }\n.screen.active { display: flex; align-items: center; justify-content: center; }\n#screen-game.active { display: flex; flex-direction: column; }\n\n/* \u2500\u2500 Lobby \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n.lobby-card, .waiting-card {\n  background: var(--card-bg);\n  border: 1px solid var(--card-border);\n  border-radius: var(--radius);\n  padding: 2.5rem 2.5rem 2rem;\n  width: min(420px, 92vw);\n  display: flex;\n  flex-direction: column;\n  gap: 1.2rem;\n  backdrop-filter: blur(12px);\n}\n\nh1 {\n  font-family: 'Playfair Display', serif;\n  font-size: 2.8rem;\n  color: var(--gold);\n  text-align: center;\n  letter-spacing: .04em;\n  line-height: 1;\n}\n\n.subtitle { text-align: center; color: var(--text-dim); font-size: .9rem; }\n\ninput[type=\"text\"] {\n  width: 100%;\n  background: rgba(255,255,255,.07);\n  border: 1px solid rgba(201,168,76,.3);\n  border-radius: 8px;\n  color: var(--ivory);\n  padding: .7rem 1rem;\n  font-size: 1rem;\n  font-family: inherit;\n  outline: none;\n  transition: border-color .2s;\n}\ninput[type=\"text\"]:focus { border-color: var(--gold); }\ninput[type=\"text\"]::placeholder { color: var(--text-dim); }\n\n.lobby-actions { display: flex; flex-direction: column; gap: .8rem; }\n.join-row { display: flex; gap: .6rem; }\n.join-row input { flex: 1; text-transform: uppercase; letter-spacing: .12em; }\n\n.btn-primary {\n  background: var(--gold);\n  color: #1a1a1a;\n  border: none;\n  border-radius: 8px;\n  padding: .75rem 1.4rem;\n  font-size: .95rem;\n  font-weight: 600;\n  font-family: inherit;\n  cursor: pointer;\n  width: 100%;\n  transition: background .15s, transform .1s;\n}\n.btn-primary:hover { background: var(--gold-light); }\n.btn-primary:active { transform: scale(.98); }\n\n.btn-secondary {\n  background: transparent;\n  color: var(--gold);\n  border: 1px solid var(--gold);\n  border-radius: 8px;\n  padding: .75rem 1.2rem;\n  font-size: .95rem;\n  font-weight: 500;\n  font-family: inherit;\n  cursor: pointer;\n  white-space: nowrap;\n  transition: background .15s;\n}\n.btn-secondary:hover { background: rgba(201,168,76,.12); }\n\n.error-msg { color: #e07070; font-size: .85rem; min-height: 1.2em; text-align: center; }\n\n/* \u2500\u2500 Waiting room \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n.room-code-display {\n  text-align: center;\n  font-size: 1.6rem;\n  font-family: 'Playfair Display', serif;\n  color: var(--gold);\n  letter-spacing: .18em;\n  display: flex;\n  align-items: center;\n  justify-content: center;\n  gap: .5rem;\n}\n\n.btn-copy {\n  background: none;\n  border: 1px solid var(--card-border);\n  color: var(--gold);\n  border-radius: 6px;\n  padding: .2rem .5rem;\n  font-size: .9rem;\n  cursor: pointer;\n}\n.btn-copy:hover { background: rgba(201,168,76,.1); }\n\n.seat-list { display: flex; flex-direction: column; gap: .5rem; }\n.seat-row {\n  display: flex;\n  align-items: center;\n  gap: .8rem;\n  padding: .6rem .9rem;\n  background: rgba(255,255,255,.05);\n  border-radius: 8px;\n  border: 1px solid rgba(255,255,255,.08);\n}\n.seat-row .seat-num { color: var(--gold); font-weight: 600; min-width: 24px; }\n.seat-row .seat-team { font-size: .75rem; color: var(--text-dim); margin-left: auto; }\n.seat-row.empty { opacity: .45; font-style: italic; }\n.waiting-hint { text-align: center; font-size: .82rem; color: var(--text-dim); }\n\n/* \u2500\u2500 Score bar \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n.score-bar {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  background: var(--felt-edge);\n  border-bottom: 1px solid rgba(201,168,76,.2);\n  padding: .5rem 1.2rem;\n  flex-shrink: 0;\n  z-index: 10;\n}\n.score-team { display: flex; align-items: center; gap: .5rem; }\n.score-team.right { flex-direction: row-reverse; }\n.team-label { font-size: .75rem; color: var(--text-dim); text-transform: uppercase; letter-spacing: .08em; }\n.team-marks { font-family: 'Playfair Display', serif; font-size: 1.8rem; color: var(--gold); line-height: 1; min-width: 2ch; text-align: center; }\n.team-pip { font-size: .7rem; color: var(--text-dim); }\n.score-center { display: flex; flex-direction: column; align-items: center; gap: .15rem; }\n#game-status-label { font-size: .82rem; color: var(--text-dim); }\n.room-tag { font-size: .7rem; color: rgba(201,168,76,.5); letter-spacing: .12em; }\n\n/* \u2500\u2500 Table wrap \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n.table-wrap {\n  flex: 1;\n  position: relative;\n  display: grid;\n  grid-template-areas:\n    \".      top    .\"\n    \"left   center right\"\n    \".      bottom .\";\n  grid-template-columns: 120px 1fr 120px;\n  grid-template-rows: 110px 1fr 130px;\n  gap: 4px;\n  padding: 8px;\n  overflow: hidden;\n}\n\n/* \u2500\u2500 Player zones \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n.player-zone {\n  display: flex;\n  align-items: center;\n  justify-content: center;\n  position: relative;\n}\n.player-zone.top    { grid-area: top;    flex-direction: column; gap: 4px; }\n.player-zone.left   { grid-area: left;   flex-direction: column; gap: 4px; }\n.player-zone.right  { grid-area: right;  flex-direction: column; gap: 4px; }\n.player-zone.bottom { grid-area: bottom; flex-direction: column; gap: 6px; }\n\n.player-name-tag {\n  font-size: .78rem;\n  font-weight: 500;\n  color: var(--text-dim);\n  background: rgba(0,0,0,.3);\n  border: 1px solid rgba(201,168,76,.15);\n  border-radius: 20px;\n  padding: .2rem .7rem;\n  white-space: nowrap;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  max-width: 100px;\n}\n.player-name-tag.active-player { color: var(--gold); border-color: rgba(201,168,76,.5); }\n\n.opponent-hand { display: flex; gap: 3px; align-items: center; justify-content: center; flex-wrap: nowrap; }\n.opponent-hand.vertical { flex-direction: column; }\n\n/* \u2500\u2500 Tile \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n.tile {\n  width: var(--tile-w);\n  height: var(--tile-h);\n  background: var(--ivory);\n  border-radius: 6px;\n  border: 1px solid #ccc;\n  display: flex;\n  flex-direction: column;\n  align-items: center;\n  justify-content: space-between;\n  padding: 5px;\n  cursor: default;\n  position: relative;\n  flex-shrink: 0;\n  user-select: none;\n  box-shadow: 0 2px 6px rgba(0,0,0,.4);\n  transition: transform .12s, box-shadow .12s;\n}\n.tile.playable {\n  cursor: pointer;\n  border-color: var(--gold);\n}\n.tile.playable:hover {\n  transform: translateY(-8px);\n  box-shadow: 0 8px 20px rgba(0,0,0,.5);\n}\n.tile.playable:active { transform: translateY(-4px); }\n\n.tile .half {\n  width: 100%;\n  display: flex;\n  align-items: center;\n  justify-content: center;\n  flex: 1;\n}\n.tile .divider {\n  width: 80%;\n  height: 1px;\n  background: #bbb;\n  flex-shrink: 0;\n}\n.tile.trump-tile { border-color: #c0392b; box-shadow: 0 0 0 2px rgba(192,57,43,.4), 0 2px 6px rgba(0,0,0,.4); }\n\n/* Opponent tile back */\n.tile-back {\n  background: var(--felt);\n  border: 1px solid rgba(201,168,76,.3);\n  width: 28px;\n  height: 52px;\n  border-radius: 4px;\n  flex-shrink: 0;\n}\n\n/* Pips */\n.pips {\n  display: grid;\n  gap: 3px;\n  align-items: center;\n  justify-items: center;\n  padding: 2px;\n}\n.pip {\n  width: var(--pip-sz);\n  height: var(--pip-sz);\n  background: var(--pip);\n  border-radius: 50%;\n}\n\n/* pip layouts */\n.pips[data-n=\"0\"] { grid-template-columns: 1fr; min-height: 24px; }\n.pips[data-n=\"1\"] { grid-template-columns: 1fr; }\n.pips[data-n=\"2\"] { grid-template-columns: 1fr 1fr; }\n.pips[data-n=\"3\"] { grid-template-columns: 1fr 1fr 1fr; }\n.pips[data-n=\"4\"] { grid-template-columns: 1fr 1fr; }\n.pips[data-n=\"5\"] { grid-template-columns: 1fr 1fr 1fr; }\n.pips[data-n=\"6\"] { grid-template-columns: 1fr 1fr 1fr; }\n\n/* \u2500\u2500 Trick area \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n.trick-area {\n  grid-area: center;\n  display: flex;\n  flex-direction: column;\n  align-items: center;\n  justify-content: center;\n  gap: 4px;\n}\n.trick-row { display: flex; align-items: center; gap: 8px; }\n.trick-slot {\n  width: var(--tile-w);\n  height: var(--tile-h);\n  display: flex;\n  align-items: center;\n  justify-content: center;\n}\n.trick-center-info {\n  display: flex;\n  flex-direction: column;\n  align-items: center;\n  justify-content: center;\n  min-width: 60px;\n}\n#trump-display {\n  font-size: .72rem;\n  color: var(--text-dim);\n  text-align: center;\n}\n\n/* Tile in trick: winning glow */\n.tile.trick-winner {\n  box-shadow: 0 0 0 3px var(--gold), 0 4px 12px rgba(0,0,0,.5);\n}\n\n/* \u2500\u2500 My hand \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n.my-hand {\n  display: flex;\n  gap: 6px;\n  align-items: flex-end;\n  justify-content: center;\n  flex-wrap: nowrap;\n  overflow-x: auto;\n  padding: 4px 4px 0;\n  max-width: 100%;\n}\n\n/* \u2500\u2500 Overlays \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n.overlay {\n  position: absolute;\n  inset: 0;\n  display: flex;\n  align-items: center;\n  justify-content: center;\n  background: rgba(0,0,0,.55);\n  backdrop-filter: blur(4px);\n  z-index: 100;\n}\n.overlay.hidden { display: none; }\n\n.overlay-card {\n  background: #0e2c1a;\n  border: 1px solid var(--card-border);\n  border-radius: var(--radius);\n  padding: 1.8rem 2rem;\n  min-width: 300px;\n  max-width: min(480px, 92vw);\n  display: flex;\n  flex-direction: column;\n  gap: 1rem;\n}\n.overlay-card h3 {\n  font-family: 'Playfair Display', serif;\n  color: var(--gold);\n  font-size: 1.4rem;\n  text-align: center;\n}\n.bid-subtitle { text-align: center; font-size: .85rem; color: var(--text-dim); }\n\n/* Bid grid */\n.bid-grid {\n  display: grid;\n  grid-template-columns: repeat(auto-fill, minmax(70px, 1fr));\n  gap: 6px;\n}\n.bid-btn {\n  background: rgba(255,255,255,.06);\n  border: 1px solid rgba(201,168,76,.25);\n  border-radius: 8px;\n  color: var(--ivory);\n  padding: .55rem .4rem;\n  font-family: inherit;\n  font-size: .88rem;\n  font-weight: 500;\n  cursor: pointer;\n  transition: background .12s, border-color .12s;\n  text-align: center;\n}\n.bid-btn:hover { background: rgba(201,168,76,.18); border-color: var(--gold); }\n.bid-btn.special { color: var(--gold); border-color: rgba(201,168,76,.5); }\n.bid-btn.pass-btn { color: #e07070; border-color: rgba(220,100,100,.3); }\n.bid-btn.double-btn { color: #8ecdf5; border-color: rgba(100,180,240,.3); }\n.bid-btn:disabled { opacity: .3; cursor: default; pointer-events: none; }\n\n/* Trump grid */\n.trump-grid {\n  display: grid;\n  grid-template-columns: repeat(4, 1fr);\n  gap: 8px;\n}\n.trump-btn {\n  display: flex;\n  flex-direction: column;\n  align-items: center;\n  gap: .3rem;\n  background: rgba(255,255,255,.06);\n  border: 1px solid rgba(201,168,76,.25);\n  border-radius: 10px;\n  color: var(--ivory);\n  padding: .9rem .5rem;\n  cursor: pointer;\n  font-family: inherit;\n  font-size: .82rem;\n  transition: background .12s, border-color .12s;\n}\n.trump-btn:hover { background: rgba(201,168,76,.18); border-color: var(--gold); }\n.trump-pip-preview {\n  width: 22px;\n  height: 22px;\n  background: var(--pip);\n  border-radius: 50%;\n  display: flex;\n  align-items: center;\n  justify-content: center;\n  color: var(--ivory);\n  font-size: .75rem;\n  font-weight: 600;\n}\n\n/* Result card */\n.result-card #result-body, .result-card #gameover-body {\n  font-size: .9rem;\n  color: var(--text-dim);\n  line-height: 1.7;\n  text-align: center;\n}\n.result-made { color: #6fcf97; }\n.result-set   { color: #eb5757; }\n\n/* Overlay side bits */\n.overlay-side { position: absolute; z-index: 50; }\n.right-side { top: 50%; right: 0; transform: translateY(-50%); }\n.waiting-pill {\n  background: rgba(0,0,0,.6);\n  border: 1px solid var(--card-border);\n  border-radius: 20px 0 0 20px;\n  padding: .5rem 1rem .5rem .9rem;\n  font-size: .8rem;\n  color: var(--text-dim);\n}\n\n/* Last trick button */\n.btn-last-trick {\n  background: rgba(0,0,0,.5);\n  border: 1px solid var(--card-border);\n  border-radius: 8px;\n  color: var(--text-dim);\n  padding: .35rem .7rem;\n  font-size: .75rem;\n  cursor: pointer;\n  font-family: inherit;\n}\n.btn-last-trick:hover { color: var(--gold); }\n.last-trick-content { display: flex; gap: 4px; flex-wrap: wrap; padding-top: .4rem; }\n.last-trick-content.hidden { display: none; }\n\n/* Dealer chip */\n.dealer-chip {\n  display: inline-block;\n  background: var(--gold);\n  color: #1a1a1a;\n  font-size: .6rem;\n  font-weight: 700;\n  border-radius: 50%;\n  width: 16px;\n  height: 16px;\n  text-align: center;\n  line-height: 16px;\n  margin-left: 4px;\n}\n\n/* Current player highlight */\n.zone-active .player-name-tag {\n  color: var(--gold);\n  border-color: rgba(201,168,76,.6);\n  background: rgba(201,168,76,.1);\n}\n\n/* Responsive tweaks */\n@media (max-width: 600px) {\n  :root { --tile-w: 40px; --tile-h: 74px; --pip-sz: 6px; }\n  .table-wrap {\n    grid-template-columns: 80px 1fr 80px;\n    grid-template-rows: 90px 1fr 110px;\n  }\n  .tile-back { width: 22px; height: 40px; }\n}\n\n</style>\n</head>\n<body>\n<div id=\"screen-lobby\" class=\"screen active\">\n  <div class=\"lobby-card\">\n    <h1>Texas&nbsp;42</h1>\n    <p class=\"subtitle\">Classic dominoes for 4 players</p>\n    <div class=\"input-group\">\n      <input id=\"player-name\" type=\"text\" placeholder=\"Your name\" maxlength=\"18\" autocomplete=\"off\">\n    </div>\n    <div class=\"lobby-actions\">\n      <button id=\"btn-create\" class=\"btn-primary\">Create Game</button>\n      <div class=\"join-row\">\n        <input id=\"room-code-input\" type=\"text\" placeholder=\"Room code\" maxlength=\"4\" autocomplete=\"off\">\n        <button id=\"btn-join\" class=\"btn-secondary\">Join</button>\n      </div>\n    </div>\n    <p id=\"lobby-error\" class=\"error-msg\"></p>\n  </div>\n</div>\n<div id=\"screen-waiting\" class=\"screen\">\n  <div class=\"waiting-card\">\n    <h2>Waiting for players</h2>\n    <div class=\"room-code-display\">\n      Room: <span id=\"display-code\">----</span>\n      <button id=\"btn-copy-code\" class=\"btn-copy\" title=\"Copy code\">&#x29C9;</button>\n    </div>\n    <div id=\"seat-list\" class=\"seat-list\"></div>\n    <p class=\"waiting-hint\">Share the room code with your friends</p>\n    <button id=\"btn-start\" class=\"btn-primary\" style=\"display:none\">Start Game</button>\n    <p id=\"waiting-error\" class=\"error-msg\"></p>\n  </div>\n</div>\n<div id=\"screen-game\" class=\"screen\">\n  <header class=\"score-bar\">\n    <div class=\"score-team\" id=\"score-team0\">\n      <span class=\"team-label\">N/S</span>\n      <span class=\"team-marks\" id=\"marks-0\">0</span>\n      <span class=\"team-pip\">marks</span>\n    </div>\n    <div class=\"score-center\">\n      <span id=\"game-status-label\">Bidding</span>\n      <span class=\"room-tag\" id=\"score-room-code\"></span>\n    </div>\n    <div class=\"score-team right\" id=\"score-team1\">\n      <span class=\"team-pip\">marks</span>\n      <span class=\"team-marks\" id=\"marks-1\">0</span>\n      <span class=\"team-label\">E/W</span>\n    </div>\n  </header>\n  <div class=\"table-wrap\">\n    <div class=\"player-zone top\" id=\"zone-top\">\n      <div class=\"player-name-tag\" id=\"name-top\"></div>\n      <div class=\"opponent-hand\" id=\"hand-top\"></div>\n    </div>\n    <div class=\"player-zone left\" id=\"zone-left\">\n      <div class=\"player-name-tag\" id=\"name-left\"></div>\n      <div class=\"opponent-hand vertical\" id=\"hand-left\"></div>\n    </div>\n    <div class=\"player-zone right\" id=\"zone-right\">\n      <div class=\"opponent-hand vertical\" id=\"hand-right\"></div>\n      <div class=\"player-name-tag\" id=\"name-right\"></div>\n    </div>\n    <div class=\"trick-area\" id=\"trick-area\">\n      <div class=\"trick-slot\" id=\"trick-top\"></div>\n      <div class=\"trick-row\">\n        <div class=\"trick-slot\" id=\"trick-left\"></div>\n        <div class=\"trick-center-info\" id=\"trick-center-info\">\n          <span id=\"trump-display\"></span>\n        </div>\n        <div class=\"trick-slot\" id=\"trick-right\"></div>\n      </div>\n      <div class=\"trick-slot\" id=\"trick-bottom\"></div>\n    </div>\n    <div class=\"player-zone bottom\" id=\"zone-bottom\">\n      <div class=\"player-name-tag\" id=\"name-bottom\"></div>\n      <div class=\"my-hand\" id=\"hand-bottom\"></div>\n    </div>\n  </div>\n  <div id=\"overlay-bid\" class=\"overlay hidden\">\n    <div class=\"overlay-card bid-card\">\n      <h3>Your Bid</h3>\n      <p class=\"bid-subtitle\" id=\"bid-current-label\"></p>\n      <div id=\"bid-buttons\" class=\"bid-grid\"></div>\n    </div>\n  </div>\n  <div id=\"overlay-trump\" class=\"overlay hidden\">\n    <div class=\"overlay-card trump-card\">\n      <h3>Select Trump</h3>\n      <p class=\"bid-subtitle\">You won the bid - choose a suit</p>\n      <div class=\"trump-grid\" id=\"trump-buttons\"></div>\n    </div>\n  </div>\n  <div id=\"overlay-last-trick\" class=\"overlay-side hidden\">\n    <button id=\"btn-show-last\" class=\"btn-last-trick\">Last trick &#9658;</button>\n    <div id=\"last-trick-content\" class=\"last-trick-content hidden\"></div>\n  </div>\n  <div id=\"overlay-hand-end\" class=\"overlay hidden\">\n    <div class=\"overlay-card result-card\">\n      <h3 id=\"result-title\"></h3>\n      <div id=\"result-body\"></div>\n      <button id=\"btn-next-hand\" class=\"btn-primary\">Next Hand</button>\n    </div>\n  </div>\n  <div id=\"overlay-game-over\" class=\"overlay hidden\">\n    <div class=\"overlay-card result-card\">\n      <h3 id=\"gameover-title\">Game Over</h3>\n      <div id=\"gameover-body\"></div>\n      <button id=\"btn-play-again\" class=\"btn-primary\">Play Again</button>\n    </div>\n  </div>\n  <div id=\"overlay-waiting-play\" class=\"overlay-side right-side hidden\">\n    <div class=\"waiting-pill\" id=\"waiting-pill-label\">Waiting...</div>\n  </div>\n</div>\n<script src=\"/socket.io/socket.io.js\"></script>\n<script>\n'use strict';\n\n// \u2500\u2500\u2500 Socket setup \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nconst socket = io();\n\n// \u2500\u2500\u2500 App state \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nlet myName = '';\nlet myRoom = '';\nlet mySeat = -1;\nlet lastState = null;\n\n// \u2500\u2500\u2500 Screen helpers \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nfunction showScreen(id) {\n  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));\n  document.getElementById(id).classList.add('active');\n}\n\n// \u2500\u2500\u2500 Lobby wiring \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\ndocument.getElementById('btn-create').addEventListener('click', () => {\n  const name = document.getElementById('player-name').value.trim();\n  if (!name) { setLobbyError('Enter your name first'); return; }\n  myName = name;\n  socket.emit('createRoom', { name });\n});\n\ndocument.getElementById('btn-join').addEventListener('click', () => {\n  const name = document.getElementById('player-name').value.trim();\n  const code = document.getElementById('room-code-input').value.trim();\n  if (!name) { setLobbyError('Enter your name first'); return; }\n  if (!code) { setLobbyError('Enter a room code'); return; }\n  myName = name;\n  socket.emit('joinRoom', { name, code });\n});\n\ndocument.getElementById('player-name').addEventListener('keydown', e => {\n  if (e.key === 'Enter') document.getElementById('btn-create').click();\n});\ndocument.getElementById('room-code-input').addEventListener('keydown', e => {\n  if (e.key === 'Enter') document.getElementById('btn-join').click();\n});\n\nfunction setLobbyError(msg) {\n  document.getElementById('lobby-error').textContent = msg;\n}\n\n// \u2500\u2500\u2500 Copy room code \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\ndocument.getElementById('btn-copy-code').addEventListener('click', () => {\n  navigator.clipboard.writeText(myRoom).then(() => {\n    document.getElementById('btn-copy-code').textContent = '\u2713';\n    setTimeout(() => document.getElementById('btn-copy-code').textContent = '\u29c9', 1500);\n  });\n});\n\n// \u2500\u2500\u2500 Start game \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\ndocument.getElementById('btn-start').addEventListener('click', () => {\n  socket.emit('startGame');\n  document.getElementById('waiting-error').textContent = '';\n});\n\n// \u2500\u2500\u2500 Next hand \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\ndocument.getElementById('btn-next-hand').addEventListener('click', () => {\n  socket.emit('nextHand');\n  hideOverlay('overlay-hand-end');\n});\n\n// \u2500\u2500\u2500 Play again (reload lobby) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\ndocument.getElementById('btn-play-again').addEventListener('click', () => {\n  location.reload();\n});\n\n// \u2500\u2500\u2500 Overlay helpers \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nfunction showOverlay(id) { document.getElementById(id).classList.remove('hidden'); }\nfunction hideOverlay(id) { document.getElementById(id).classList.add('hidden'); }\nfunction hideAllOverlays() {\n  ['overlay-bid','overlay-trump','overlay-hand-end','overlay-game-over'].forEach(hideOverlay);\n}\n\n// \u2500\u2500\u2500 Socket events \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nsocket.on('error', msg => {\n  const lobbyErr = document.getElementById('lobby-error');\n  const waitErr  = document.getElementById('waiting-error');\n  if (document.getElementById('screen-lobby').classList.contains('active')) setLobbyError(msg);\n  else if (document.getElementById('screen-waiting').classList.contains('active')) waitErr.textContent = msg;\n  else alert(msg);\n});\n\nsocket.on('joined', ({ code, seat, name }) => {\n  myRoom = code;\n  mySeat = seat;\n  myName = name;\n  document.getElementById('display-code').textContent = code;\n  document.getElementById('score-room-code').textContent = code;\n  document.getElementById('btn-start').style.display = seat === 0 ? 'block' : 'none';\n  showScreen('screen-waiting');\n  // Store for potential rejoin\n  sessionStorage.setItem('42-room', code);\n  sessionStorage.setItem('42-seat', seat);\n  sessionStorage.setItem('42-name', name);\n});\n\nsocket.on('state', (state) => {\n  lastState = state;\n  if (state.state === 'lobby') {\n    renderWaiting(state);\n    if (!document.getElementById('screen-waiting').classList.contains('active')) {\n      showScreen('screen-waiting');\n    }\n    return;\n  }\n\n  if (!document.getElementById('screen-game').classList.contains('active')) {\n    showScreen('screen-game');\n  }\n  renderGame(state);\n});\n\n// \u2500\u2500\u2500 Waiting room render \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nfunction renderWaiting(state) {\n  const list = document.getElementById('seat-list');\n  list.innerHTML = '';\n  const teams = ['N/S','E/W','N/S','E/W'];\n  const positions = ['North','East','South','West'];\n  state.seats.forEach((seat, i) => {\n    const row = document.createElement('div');\n    row.className = `seat-row${!seat ? ' empty' : ''}`;\n    row.innerHTML = `<span class=\"seat-num\">${i+1}</span>\n      <span>${seat ? (seat.disconnected ? seat.name + ' (away)' : seat.name) : 'Empty'}</span>\n      <span class=\"seat-team\">${positions[i]} \u00b7 ${teams[i]}</span>`;\n    list.appendChild(row);\n  });\n}\n\n// \u2500\u2500\u2500 Game render \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nconst SUIT_NAMES = ['Blanks','Ones','Twos','Threes','Fours','Fives','Sixes'];\n\nfunction seatOffset(targetSeat) {\n  // Returns position relative to me: 0=bottom(me), 1=left, 2=top, 3=right (CCW)\n  return ((targetSeat - mySeat + 4) % 4);\n}\n\nfunction positionForOffset(offset) {\n  return ['bottom','left','top','right'][offset];\n}\n\nfunction renderGame(state) {\n  // Score\n  document.getElementById('marks-0').textContent = state.score[0];\n  document.getElementById('marks-1').textContent = state.score[1];\n\n  // Status label\n  const statusLabels = {\n    bidding: 'Bidding',\n    trump_select: 'Selecting trump',\n    playing: state.trump !== null ? `Trump: ${SUIT_NAMES[state.trump]}` : 'Playing',\n    hand_end: 'Hand over',\n    game_over: 'Game over',\n  };\n  document.getElementById('game-status-label').textContent = statusLabels[state.state] || '';\n\n  // Trump display\n  document.getElementById('trump-display').textContent =\n    state.trump !== null ? `Trump\\n${SUIT_NAMES[state.trump]}` : '';\n\n  // Render each player's zone\n  for (let s = 0; s < 4; s++) {\n    const offset = seatOffset(s);\n    const pos = positionForOffset(offset);\n    const nameEl = document.getElementById(`name-${pos}`);\n    const handEl = document.getElementById(`hand-${pos}`);\n\n    if (!nameEl || !handEl) continue;\n\n    // Name tag\n    const seat = state.seats[s];\n    let nameText = seat ? seat.name : `Seat ${s+1}`;\n    if (s === state.dealer) nameText += '<span class=\"dealer-chip\">D</span>';\n    nameEl.innerHTML = nameText;\n\n    const isCurrentPlayer = (state.state === 'playing' && state.currentPlayer === s)\n      || (state.state === 'bidding' && state.currentBidder === s)\n      || (state.state === 'trump_select' && state.bid?.seatIndex === s);\n    nameEl.classList.toggle('active-player', isCurrentPlayer);\n    document.getElementById(`zone-${pos}`)?.classList.toggle('zone-active', isCurrentPlayer);\n\n    // Hand\n    handEl.innerHTML = '';\n    if (s === mySeat) {\n      // My hand \u2014 render full tiles\n      const isMyTurn = state.state === 'playing' && state.currentPlayer === mySeat;\n      (state.myHand || []).forEach(tile => {\n        const el = renderTile(tile, isMyTurn, state.trump);\n        if (isMyTurn) {\n          el.classList.add('playable');\n          el.addEventListener('click', () => socket.emit('playTile', { tileId: tile.id }));\n        }\n        handEl.appendChild(el);\n      });\n    } else {\n      // Opponent \u2014 show backs\n      const count = getHandCount(state, s);\n      for (let i = 0; i < count; i++) {\n        const back = document.createElement('div');\n        back.className = 'tile-back';\n        handEl.appendChild(back);\n      }\n    }\n  }\n\n  // Trick area\n  renderTrickArea(state);\n\n  // Overlays\n  hideAllOverlays();\n\n  if (state.state === 'bidding' && state.currentBidder === mySeat) {\n    renderBidOverlay(state);\n    showOverlay('overlay-bid');\n  } else if (state.state === 'trump_select' && state.bid?.seatIndex === mySeat) {\n    renderTrumpOverlay(state);\n    showOverlay('overlay-trump');\n  } else if (state.state === 'hand_end') {\n    renderHandEnd(state);\n    showOverlay('overlay-hand-end');\n  } else if (state.state === 'game_over') {\n    renderGameOver(state);\n    showOverlay('overlay-game-over');\n  }\n\n  // Last trick button\n  if (state.lastTrick) {\n    document.getElementById('overlay-last-trick').classList.remove('hidden');\n    renderLastTrick(state);\n  } else {\n    document.getElementById('overlay-last-trick').classList.add('hidden');\n  }\n}\n\nfunction getHandCount(state, seat) {\n  // Approximate: 7 minus tricks taken so far\n  const tricksPlayed = state.trickCount ? state.trickCount.reduce((a,b)=>a+b,0) : 0;\n  return Math.max(0, 7 - tricksPlayed);\n}\n\n// \u2500\u2500\u2500 Tile renderer \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nfunction renderTile(tile, playable, trump) {\n  const el = document.createElement('div');\n  el.className = 'tile';\n  if (trump !== null && (tile.hi === trump || tile.lo === trump)) {\n    el.classList.add('trump-tile');\n  }\n  el.dataset.id = tile.id;\n\n  const topHalf = document.createElement('div');\n  topHalf.className = 'half';\n  topHalf.appendChild(makePips(tile.hi));\n\n  const divider = document.createElement('div');\n  divider.className = 'divider';\n\n  const botHalf = document.createElement('div');\n  botHalf.className = 'half';\n  botHalf.appendChild(makePips(tile.lo));\n\n  el.appendChild(topHalf);\n  el.appendChild(divider);\n  el.appendChild(botHalf);\n  return el;\n}\n\n// Pip layouts: positions for 0-6\nconst PIP_LAYOUTS = {\n  0: [],\n  1: [[1,1]],\n  2: [[0,0],[2,2]],\n  3: [[0,0],[1,1],[2,2]],\n  4: [[0,0],[2,0],[0,2],[2,2]],\n  5: [[0,0],[2,0],[1,1],[0,2],[2,2]],\n  6: [[0,0],[2,0],[0,1],[2,1],[0,2],[2,2]],\n};\n\nfunction makePips(n) {\n  const container = document.createElement('div');\n  container.className = 'pips';\n  container.dataset.n = n;\n\n  if (n === 0) return container;\n\n  const layout = PIP_LAYOUTS[n] || [];\n\n  // Build 3x3 grid slots, place pips\n  if (n <= 2) {\n    layout.forEach(() => {\n      const pip = document.createElement('div');\n      pip.className = 'pip';\n      container.appendChild(pip);\n    });\n    return container;\n  }\n\n  // For 3+, use absolute positioning in a small grid\n  container.style.cssText = 'position:relative;width:28px;height:28px;';\n  layout.forEach(([col, row]) => {\n    const pip = document.createElement('div');\n    pip.className = 'pip';\n    pip.style.cssText = `position:absolute;left:${col*10}px;top:${row*10}px;`;\n    container.appendChild(pip);\n  });\n  return container;\n}\n\n// \u2500\u2500\u2500 Trick area render \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nfunction renderTrickArea(state) {\n  const slots = {\n    bottom: document.getElementById('trick-bottom'),\n    left:   document.getElementById('trick-left'),\n    top:    document.getElementById('trick-top'),\n    right:  document.getElementById('trick-right'),\n  };\n\n  // Clear\n  Object.values(slots).forEach(s => s.innerHTML = '');\n\n  state.trick.forEach(play => {\n    const offset = seatOffset(play.seatIndex);\n    const pos = positionForOffset(offset);\n    const slot = slots[pos];\n    if (!slot) return;\n    const tileEl = renderTile(play.tile, false, state.trump);\n    // Highlight winner of last trick\n    if (state.lastTrick && state.trick.length === 0) {\n      // handled via lastTrick\n    }\n    slot.appendChild(tileEl);\n  });\n\n  // If trick just finished (lastTrick set, trick is empty) show winner highlight briefly\n  if (state.lastTrick && state.trick.length === 0 && state.state === 'playing') {\n    // Show last trick tiles briefly then clear \u2014 handled by lastTrick panel\n  }\n}\n\n// \u2500\u2500\u2500 Bid overlay \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nfunction renderBidOverlay(state) {\n  const currentBid = state.bid;\n  const label = currentBid?.label || 'None';\n  document.getElementById('bid-current-label').textContent =\n    `Current bid: ${label === '' ? 'None' : label}`;\n\n  const grid = document.getElementById('bid-buttons');\n  grid.innerHTML = '';\n\n  // Numeric 30-42\n  for (let b = 30; b <= 42; b++) {\n    if (b > (currentBid?.amount || 29) && !currentBid?.special) {\n      addBidBtn(grid, { amount: b, special: null, label: String(b) }, 'btn');\n    }\n  }\n\n  // Doubling chain\n  [84,126,168,210].forEach(d => {\n    if (!currentBid?.special && d > (currentBid?.amount || 0)) {\n      addBidBtn(grid, { amount: d, special: null, label: String(d) }, 'double-btn');\n    }\n  });\n\n  // Special bids\n  if (!currentBid?.special) {\n    addBidBtn(grid, { amount: 42, special: 'low', label: 'Low 42' }, 'special');\n  }\n\n  // Plunge: need 4+ doubles\n  const myHand = state.myHand || [];\n  const doubleCount = myHand.filter(t => t.hi === t.lo).length;\n  if (doubleCount >= 4 && !currentBid?.special && (currentBid?.amount || 0) < 42) {\n    addBidBtn(grid, { amount: 84, special: 'plunge', label: 'Plunge' }, 'special');\n  }\n\n  // Follow me \u2014 always available\n  addBidBtn(grid, { amount: 42, special: 'follow_me', label: 'Follow Me' }, 'special');\n\n  // Pass\n  addBidBtn(grid, { amount: 0, special: 'pass', label: 'Pass' }, 'pass-btn');\n}\n\nfunction addBidBtn(container, bid, cls) {\n  const btn = document.createElement('button');\n  btn.className = `bid-btn ${cls}`;\n  btn.textContent = bid.label;\n  btn.addEventListener('click', () => {\n    socket.emit('placeBid', { amount: bid.amount, special: bid.special });\n    hideOverlay('overlay-bid');\n  });\n  container.appendChild(btn);\n}\n\n// \u2500\u2500\u2500 Trump overlay \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nfunction renderTrumpOverlay(state) {\n  const grid = document.getElementById('trump-buttons');\n  grid.innerHTML = '';\n\n  // Show my hand to help choose trump\n  const myHand = state.myHand || [];\n  const countPerSuit = Array(7).fill(0);\n  myHand.forEach(t => { countPerSuit[t.hi]++; if (t.hi !== t.lo) countPerSuit[t.lo]++; });\n\n  SUIT_NAMES.forEach((name, i) => {\n    const btn = document.createElement('button');\n    btn.className = 'trump-btn';\n\n    const preview = document.createElement('div');\n    preview.className = 'trump-pip-preview';\n    preview.textContent = i;\n\n    const label = document.createElement('span');\n    label.textContent = name;\n\n    const count = document.createElement('span');\n    count.style.cssText = 'font-size:.7rem;color:var(--gold);';\n    count.textContent = `${countPerSuit[i]} tiles`;\n\n    btn.appendChild(preview);\n    btn.appendChild(label);\n    btn.appendChild(count);\n\n    btn.addEventListener('click', () => {\n      socket.emit('selectTrump', { trump: i });\n      hideOverlay('overlay-trump');\n    });\n    grid.appendChild(btn);\n  });\n}\n\n// \u2500\u2500\u2500 Hand end overlay \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nfunction renderHandEnd(state) {\n  const last = state.handHistory[state.handHistory.length - 1];\n  if (!last) return;\n\n  const bidTeamName = last.bidTeam === 0 ? 'N/S' : 'E/W';\n  const defTeamName = last.bidTeam === 0 ? 'E/W' : 'N/S';\n  const myTeam = mySeat % 2;\n  const made = last.made;\n\n  document.getElementById('result-title').textContent = made ? `${bidTeamName} made it!` : `${bidTeamName} was set!`;\n\n  const marksFor = Object.values(last.delta).reduce((a,b)=>a+b,0);\n  const winTeam = last.delta[0] > 0 ? 'N/S' : 'E/W';\n\n  document.getElementById('result-body').innerHTML = `\n    <p class=\"${made ? 'result-made' : 'result-set'}\">\n      ${made ? '\u2713' : '\u2717'} Bid: ${last.bid.label} \u00b7 ${made ? 'Made' : 'Set'}\n    </p>\n    <p style=\"margin-top:.5rem\">${winTeam} gets ${marksFor} mark${marksFor !== 1 ? 's' : ''}</p>\n    <p style=\"margin-top:.5rem\">Score \u2014 N/S: <strong>${state.score[0]}</strong> \u00b7 E/W: <strong>${state.score[1]}</strong></p>\n    <p style=\"margin-top:.3rem;font-size:.78rem;color:var(--text-dim)\">First to 7 marks wins</p>\n  `;\n}\n\n// \u2500\u2500\u2500 Game over overlay \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nfunction renderGameOver(state) {\n  const winner = state.score[0] >= 7 ? 'N/S' : 'E/W';\n  const myTeam = mySeat % 2 === 0 ? 'N/S' : 'E/W';\n  document.getElementById('gameover-title').textContent =\n    winner === myTeam ? '\ud83c\udf89 Your team wins!' : `${winner} wins!`;\n  document.getElementById('gameover-body').innerHTML = `\n    <p>Final score</p>\n    <p style=\"font-size:1.3rem;color:var(--gold);margin:.5rem 0\">\n      N/S ${state.score[0]} \u2013 ${state.score[1]} E/W\n    </p>\n  `;\n}\n\n// \u2500\u2500\u2500 Last trick panel \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nconst btnLastTrick = document.getElementById('btn-show-last');\nlet lastTrickVisible = false;\nbtnLastTrick.addEventListener('click', () => {\n  lastTrickVisible = !lastTrickVisible;\n  document.getElementById('last-trick-content').classList.toggle('hidden', !lastTrickVisible);\n  btnLastTrick.textContent = lastTrickVisible ? 'Last trick \u25bc' : 'Last trick \u25b6';\n});\n\nfunction renderLastTrick(state) {\n  if (!state.lastTrick) return;\n  const el = document.getElementById('last-trick-content');\n  el.innerHTML = '';\n  state.lastTrick.plays.forEach(play => {\n    const wrapper = document.createElement('div');\n    wrapper.style.cssText = 'display:flex;flex-direction:column;align-items:center;gap:2px;';\n    const tileEl = renderTile(play.tile, false, state.trump);\n    tileEl.style.cssText = `width:32px;height:58px;`;\n    if (play.seatIndex === state.lastTrick.winner) tileEl.classList.add('trick-winner');\n    const nameTag = document.createElement('div');\n    nameTag.style.cssText = 'font-size:.65rem;color:var(--text-dim);text-align:center;max-width:36px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';\n    nameTag.textContent = state.seats[play.seatIndex]?.name || `P${play.seatIndex+1}`;\n    wrapper.appendChild(tileEl);\n    wrapper.appendChild(nameTag);\n    el.appendChild(wrapper);\n  });\n}\n\n// \u2500\u2500\u2500 Rejoin on reconnect \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nsocket.on('connect', () => {\n  const code = sessionStorage.getItem('42-room');\n  const seat = sessionStorage.getItem('42-seat');\n  const name = sessionStorage.getItem('42-name');\n  if (code && seat !== null && name) {\n    mySeat = parseInt(seat);\n    myRoom = code;\n    myName = name;\n    socket.emit('rejoin', { code, seat: parseInt(seat), name });\n  }\n});\n\n</script>\n</body>\n</html>";
-app.get('/', (req, res) => { res.setHeader('Content-Type', 'text/html'); res.send(PAGE_HTML); });
-app.get('/index.html', (req, res) => { res.setHeader('Content-Type', 'text/html'); res.send(PAGE_HTML); });
+app.get('/', (req, res) => { res.setHeader('Content-Type', 'text/html'); res.send(getHTML()); });
+app.get('/index.html', (req, res) => { res.setHeader('Content-Type', 'text/html'); res.send(getHTML()); });
 
 // ─── Room storage ─────────────────────────────────────────────────────────────
 
@@ -173,21 +943,24 @@ function makeRoom(code) {
     bid: null,
     bids: [],
     currentBidder: 0,
-    passCount: 0,
     trump: null,
+    bidType: null,       // 'high' | 'low' | 'plunge' | 'follow_me'
+    trickTrump: null,    // for follow_me: trump of current trick
+    trumpSelector: -1,   // who picks trump
+    sittingOut: -1,      // seat index of player sitting out (42 low)
     trick: [],
-    tricksTaken: [0, 0, 0, 0],
-    pointsTaken: [0, 0, 0, 0],
-    trickCount: [0, 0, 0, 0],
+    trickCount: [0,0,0,0],
+    pointsTaken: [0,0,0,0],
     currentPlayer: 0,
     score: [0, 0],
     dealer: 0,
     lastTrick: null,
     handHistory: [],
+    boneyard: [],        // all tiles played this game
   };
 }
 
-function roomSummary(room) {
+function pub(room) {
   return {
     code: room.code,
     seats: room.seats,
@@ -196,78 +969,138 @@ function roomSummary(room) {
     bids: room.bids,
     currentBidder: room.currentBidder,
     trump: room.trump,
+    bidType: room.bidType,
+    trickTrump: room.trickTrump,
+    trumpSelector: room.trumpSelector,
+    sittingOut: room.sittingOut,
     trick: room.trick,
-    tricksTaken: room.tricksTaken,
-    pointsTaken: room.pointsTaken,
     trickCount: room.trickCount,
+    pointsTaken: room.pointsTaken,
     currentPlayer: room.currentPlayer,
     score: room.score,
     dealer: room.dealer,
     lastTrick: room.lastTrick,
     handHistory: room.handHistory,
+    boneyard: room.boneyard,
   };
 }
 
-function broadcastRoom(room) {
+function broadcast(room) {
   for (let i = 0; i < 4; i++) {
     const seat = room.seats[i];
-    if (!seat) continue;
+    if (!seat || seat.disconnected) continue;
+    // Compute available bids if this player is the current bidder
+    let availableBids = [];
+    if (room.state === 'bidding' && room.currentBidder === i) {
+      availableBids = getAvailableBids(room.bid, room.hands[i], room.bids);
+    }
     io.to(seat.socketId).emit('state', {
-      ...roomSummary(room),
+      ...pub(room),
       myHand: room.hands[i],
       mySeat: i,
+      availableBids,
     });
   }
 }
 
-function findRoomBySocket(socketId) {
-  for (const room of rooms.values()) {
-    for (let i = 0; i < 4; i++) {
+function findRoom(socketId) {
+  for (const room of rooms.values())
+    for (let i = 0; i < 4; i++)
       if (room.seats[i]?.socketId === socketId) return { room, seat: i };
-    }
-  }
   return null;
 }
 
 // ─── Game flow ────────────────────────────────────────────────────────────────
 
 function startBidding(room) {
-  const hands = deal();
-  room.hands = hands;
-  room.bid = { amount: 0, special: null, seatIndex: -1, label: '' };
+  room.hands = deal();
+  room.bid = { amount: 0, type: null, label: '', marks: 0 };
   room.bids = [];
-  room.passCount = 0;
   room.trump = null;
+  room.bidType = null;
+  room.trickTrump = null;
+  room.trumpSelector = -1;
+  room.sittingOut = -1;
   room.trick = [];
-  room.tricksTaken = [0, 0, 0, 0];
-  room.pointsTaken = [0, 0, 0, 0];
-  room.trickCount = [0, 0, 0, 0];
+  room.trickCount = [0,0,0,0];
+  room.pointsTaken = [0,0,0,0];
   room.lastTrick = null;
   room.currentBidder = (room.dealer + 1) % 4;
   room.state = 'bidding';
-  broadcastRoom(room);
+  broadcast(room);
 }
 
 function advanceBidder(room) {
-  room.currentBidder = (room.currentBidder + 1) % 4;
+  // Find next non-passed seat
+  const passed = new Set(room.bids.filter(b => b.type === 'pass').map(b => b.seatIndex));
+  let next = (room.currentBidder + 1) % 4;
   let loops = 0;
-  while (room.bids.find(b => b.seatIndex === room.currentBidder && b.special === 'pass')) {
-    room.currentBidder = (room.currentBidder + 1) % 4;
-    if (++loops > 4) break;
-  }
+  while (passed.has(next) && loops++ < 4) next = (next + 1) % 4;
+  room.currentBidder = next;
 }
 
-function checkBiddingDone(room) {
-  const passed = new Set(room.bids.filter(b => b.special === 'pass').map(b => b.seatIndex));
-  const active = [0, 1, 2, 3].filter(i => !passed.has(i));
-  return active.length === 1 || room.bid.special === 'plunge' || room.bid.special === 'follow_me';
+function biddingComplete(room) {
+  const passed = new Set(room.bids.filter(b => b.type === 'pass').map(b => b.seatIndex));
+  const active = [0,1,2,3].filter(i => !passed.has(i));
+  // Done if only one active bidder, or a plunge was bid (instant win)
+  if (active.length === 1) return true;
+  if (room.bid.type === 'plunge') return true;
+  return false;
+}
+
+function openTrumpSelect(room) {
+  const bid = room.bid;
+  room.bidType = bid.type;
+
+  if (bid.type === 'low') {
+    // No trump, no trump select — bidder leads, partner sits out
+    room.trump = null;
+    room.trumpSelector = -1;
+    room.sittingOut = (bid.seatIndex + 2) % 4; // partner is opposite seat
+    room.currentPlayer = bid.seatIndex;
+    room.state = 'playing';
+    broadcast(room);
+    return;
+  }
+
+  if (bid.type === 'plunge') {
+    // Partner picks trump and leads
+    const partner = (bid.seatIndex + 2) % 4;
+    room.trumpSelector = partner;
+    room.state = 'plunge_trump_select';
+    broadcast(room);
+    return;
+  }
+
+  // High or follow_me — bidder picks trump (follow_me is just a trump option)
+  room.trumpSelector = bid.seatIndex;
+  room.state = 'trump_select';
+  broadcast(room);
+}
+
+function startPlay(room, trump, followMe) {
+  if (followMe) {
+    room.bidType = 'follow_me';
+    room.trump = null;
+    room.trickTrump = null;
+  } else {
+    room.trump = trump;
+  }
+
+  if (room.state === 'plunge_trump_select') {
+    // Partner leads
+    room.currentPlayer = (room.bid.seatIndex + 2) % 4;
+  } else {
+    room.currentPlayer = room.bid.seatIndex;
+  }
+  room.state = 'playing';
+  broadcast(room);
 }
 
 function resolveHand(room) {
   const delta = scoreHand(room.bid, room.trickCount, room.pointsTaken);
   room.score[0] += delta[0];
   room.score[1] += delta[1];
-
   const bidTeam = room.bid.seatIndex % 2;
   room.handHistory.push({
     bid: room.bid,
@@ -276,184 +1109,197 @@ function resolveHand(room) {
     bidTeam,
     made: delta[bidTeam] > 0,
   });
-
   room.state = room.score[0] >= 7 || room.score[1] >= 7 ? 'game_over' : 'hand_end';
   room.dealer = (room.dealer + 1) % 4;
-  broadcastRoom(room);
+  broadcast(room);
 }
 
 // ─── Socket handlers ──────────────────────────────────────────────────────────
 
-io.on('connection', (socket) => {
+io.on('connection', socket => {
 
   socket.on('createRoom', ({ name }) => {
     let code;
-    do { code = Math.random().toString(36).slice(2, 6).toUpperCase(); }
-    while (rooms.has(code));
-
+    do { code = Math.random().toString(36).slice(2,6).toUpperCase(); } while (rooms.has(code));
     const room = makeRoom(code);
+    // Random dealer assigned when game starts
     room.seats[0] = { socketId: socket.id, name };
     rooms.set(code, room);
     socket.join(code);
     socket.emit('joined', { code, seat: 0, name });
-    broadcastRoom(room);
+    broadcast(room);
   });
 
   socket.on('joinRoom', ({ code, name }) => {
     const room = rooms.get(code.toUpperCase());
     if (!room) { socket.emit('error', 'Room not found'); return; }
     if (room.state !== 'lobby') { socket.emit('error', 'Game already in progress'); return; }
-
-    const emptySeat = room.seats.findIndex(s => s === null);
-    if (emptySeat === -1) { socket.emit('error', 'Room is full'); return; }
-
-    room.seats[emptySeat] = { socketId: socket.id, name };
+    const empty = room.seats.findIndex(s => s === null);
+    if (empty === -1) { socket.emit('error', 'Room is full'); return; }
+    room.seats[empty] = { socketId: socket.id, name };
     socket.join(code.toUpperCase());
-    socket.emit('joined', { code: room.code, seat: emptySeat, name });
-    broadcastRoom(room);
+    socket.emit('joined', { code: room.code, seat: empty, name });
+    broadcast(room);
   });
 
   socket.on('startGame', () => {
-    const found = findRoomBySocket(socket.id);
-    if (!found) return;
+    const found = findRoom(socket.id); if (!found) return;
     const { room, seat } = found;
-    if (seat !== 0) { socket.emit('error', 'Only the host can start the game'); return; }
-    if (room.seats.some(s => s === null)) { socket.emit('error', 'Need 4 players to start'); return; }
+    if (seat !== 0) { socket.emit('error', 'Only the host can start'); return; }
+    if (room.seats.some(s => s === null)) { socket.emit('error', 'Need 4 players'); return; }
+    // Random dealer
+    room.dealer = Math.floor(Math.random() * 4);
     startBidding(room);
   });
 
-  socket.on('placeBid', ({ amount, special }) => {
-    const found = findRoomBySocket(socket.id);
-    if (!found) return;
+  socket.on('placeBid', ({ amount, type, marks, plungeLevel }) => {
+    const found = findRoom(socket.id); if (!found) return;
     const { room, seat } = found;
     if (room.state !== 'bidding') return;
     if (room.currentBidder !== seat) { socket.emit('error', 'Not your turn to bid'); return; }
 
-    const label = special === 'pass' ? 'Pass'
-      : special === 'low' ? 'Low'
-      : special === 'plunge' ? 'Plunge'
-      : special === 'follow_me' ? 'Follow Me'
+    const label = type === 'pass' ? 'Pass'
+      : type === 'low'    ? `${amount} Low`
+      : type === 'plunge' ? `Plunge (${plungeLevel || 2} marks)`
       : String(amount);
 
-    const thisBid = { amount, special: special || null, seatIndex: seat, label };
+    const bidObj = { amount, type, label, marks: marks || 1, plungeLevel, seatIndex: seat };
 
-    if (special === 'pass') {
-      room.bids.push(thisBid);
-      room.passCount++;
-      const passed = room.bids.filter(b => b.special === 'pass').length;
-      if (passed === 3 && room.bid.seatIndex !== -1) {
-        openTrumpSelect(room);
-        return;
-      }
+    if (type === 'pass') {
+      room.bids.push(bidObj);
+      const passed = room.bids.filter(b => b.type === 'pass').length;
+      // If 3 passed and someone has a real bid
+      if (passed === 3 && room.bid.amount > 0) { openTrumpSelect(room); return; }
+      // If all 4 pass somehow — dealer forced (shouldn't happen with dealer logic but safety net)
       if (passed === 4) {
-        room.bid = { amount: 30, special: null, seatIndex: room.dealer, label: '30 (forced)' };
+        room.bid = { amount: 30, type: 'high', label: '30 (forced)', marks: 1, seatIndex: room.dealer };
         room.bids.push(room.bid);
-        openTrumpSelect(room);
-        return;
+        openTrumpSelect(room); return;
       }
+      // If we've come back around to dealer and dealer is last
       advanceBidder(room);
-      broadcastRoom(room);
-      return;
+      // Check if next bidder is dealer and everyone else passed — dealer must bid
+      const passedSet = new Set(room.bids.filter(b => b.type === 'pass').map(b => b.seatIndex));
+      const active = [0,1,2,3].filter(i => !passedSet.has(i));
+      if (active.length === 1 && room.bid.amount === 0) {
+        // Dealer forced — they must bid but we wait for them to choose
+      }
+      broadcast(room); return;
     }
 
-    room.bid = thisBid;
-    room.bids.push(thisBid);
+    room.bid = bidObj;
+    room.bids.push(bidObj);
 
-    if (checkBiddingDone(room)) {
-      openTrumpSelect(room);
-    } else {
-      advanceBidder(room);
-      broadcastRoom(room);
-    }
+    if (biddingComplete(room)) { openTrumpSelect(room); return; }
+    advanceBidder(room);
+    broadcast(room);
   });
 
-  function openTrumpSelect(room) {
-    room.state = 'trump_select';
-    broadcastRoom(room);
-  }
-
-  socket.on('selectTrump', ({ trump }) => {
-    const found = findRoomBySocket(socket.id);
-    if (!found) return;
+  socket.on('selectTrump', ({ trump, followMe }) => {
+    const found = findRoom(socket.id); if (!found) return;
     const { room, seat } = found;
-    if (room.state !== 'trump_select') return;
-    if (room.bid.seatIndex !== seat) { socket.emit('error', 'Only the bid winner selects trump'); return; }
-    if (trump < 0 || trump > 6) return;
-    room.trump = trump;
-    room.state = 'playing';
-    room.currentPlayer = room.bid.seatIndex;
-    broadcastRoom(room);
+    if (room.state !== 'trump_select' && room.state !== 'plunge_trump_select') return;
+    if (room.trumpSelector !== seat) { socket.emit('error', 'Not your turn to select trump'); return; }
+    startPlay(room, trump, followMe);
   });
 
   socket.on('playTile', ({ tileId }) => {
-    const found = findRoomBySocket(socket.id);
-    if (!found) return;
+    const found = findRoom(socket.id); if (!found) return;
     const { room, seat } = found;
     if (room.state !== 'playing') return;
     if (room.currentPlayer !== seat) { socket.emit('error', 'Not your turn'); return; }
+    if (room.sittingOut === seat) { socket.emit('error', 'You are sitting out this hand'); return; }
 
     const hand = room.hands[seat];
-    const tileIdx = hand.findIndex(t => t.id === tileId);
-    if (tileIdx === -1) { socket.emit('error', 'Tile not in hand'); return; }
+    const idx = hand.findIndex(t => t.id === tileId);
+    if (idx === -1) { socket.emit('error', 'Tile not in hand'); return; }
 
+    const tile = hand[idx];
+
+    // Follow-suit enforcement
     if (room.trick.length > 0) {
       const leadTile = room.trick[0].tile;
-      const trump = room.trump;
-      const leadIsThump = isTrump(leadTile, trump);
-      const leadSuit = leadIsThump ? trump : (leadTile.hi === trump ? leadTile.lo : leadTile.hi);
-      const tile = hand[tileIdx];
-      const tileIsTrump = isTrump(tile, trump);
+      const effectiveTrump = room.bidType === 'follow_me' ? room.trickTrump : room.trump;
 
-      const canFollowSuit = hand.some(t => {
-        if (leadIsThump) return isTrump(t, trump);
-        return !isTrump(t, trump) && (t.hi === leadSuit || t.lo === leadSuit);
-      });
+      const leadIsTrump = effectiveTrump !== null && (leadTile.hi === effectiveTrump || leadTile.lo === effectiveTrump);
+      const ledSuit = leadIsTrump ? effectiveTrump : leadTile.hi;
+      const tileIsTrump = effectiveTrump !== null && (tile.hi === effectiveTrump || tile.lo === effectiveTrump);
 
-      if (canFollowSuit) {
-        const follows = leadIsThump
-          ? tileIsTrump
-          : (!tileIsTrump && (tile.hi === leadSuit || tile.lo === leadSuit));
-        if (!follows) { socket.emit('error', 'Must follow suit'); return; }
+      if (effectiveTrump === null) {
+        // Low hand: no trump, follow high-end suit
+        const ledSuitLow = leadTile.hi;
+        const canFollow = hand.some(t => t.hi === ledSuitLow || t.lo === ledSuitLow);
+        if (canFollow && !(tile.hi === ledSuitLow || tile.lo === ledSuitLow)) {
+          socket.emit('error', 'Must follow suit'); return;
+        }
+      } else {
+        const canFollowTrump = hand.some(t => t.hi === effectiveTrump || t.lo === effectiveTrump);
+        const canFollowSuit  = hand.some(t => (t.hi !== effectiveTrump && t.lo !== effectiveTrump) && (t.hi === ledSuit || t.lo === ledSuit));
+        if (leadIsTrump && canFollowTrump && !tileIsTrump) { socket.emit('error', 'Must follow trump'); return; }
+        if (!leadIsTrump && canFollowSuit && (tileIsTrump || !(tile.hi === ledSuit || tile.lo === ledSuit))) { socket.emit('error', 'Must follow suit'); return; }
       }
     }
 
-    const tile = hand.splice(tileIdx, 1)[0];
+    // Set follow_me trick trump on the lead play
+    if (room.bidType === 'follow_me' && room.trick.length === 0) {
+      room.trickTrump = tile.hi; // high end of lead sets trump for this trick
+    }
+
+    hand.splice(idx, 1)[0];
     room.trick.push({ seatIndex: seat, tile });
 
-    if (room.trick.length === 4) {
-      const winnerSeat = trickWinner(room.trick, room.trump);
-      const pts = room.trick.reduce((s, p) => s + tileScore(p.tile), 0) + 1;
-      room.pointsTaken[winnerSeat] += pts;
-      room.trickCount[winnerSeat]++;
-      room.tricksTaken[winnerSeat]++;
-      room.lastTrick = { plays: [...room.trick], winner: winnerSeat };
-      room.trick = [];
-      room.currentPlayer = winnerSeat;
+    // In low hand, skip sitting-out player
+    const activePlayers = room.sittingOut >= 0 ? [0,1,2,3].filter(s => s !== room.sittingOut) : [0,1,2,3];
 
-      const totalTricks = room.trickCount.reduce((a, b) => a + b, 0);
-      if (totalTricks === 7) {
-        resolveHand(room);
-        return;
+    if (room.trick.length === activePlayers.length) {
+      // Resolve trick
+      const effectiveTrump = room.bidType === 'follow_me' ? room.trickTrump : room.trump;
+      const winner = trickWinner(room.trick, effectiveTrump);
+      const pts = room.trick.reduce((s, p) => s + tileScore(p.tile), 0) + 1;
+      room.pointsTaken[winner] += pts;
+      room.trickCount[winner]++;
+
+      // Add played tiles to boneyard
+      room.trick.forEach(p => room.boneyard.push(p.tile));
+
+      room.lastTrick = { plays: [...room.trick], winner };
+      room.trick = [];
+      room.trickTrump = null; // reset for next trick in follow_me
+
+      // Low hand: if bidder took a trick, they lose immediately
+      if (room.bidType === 'low' && winner === room.bid.seatIndex) {
+        resolveHand(room); return;
       }
+
+      const totalTricks = room.trickCount.reduce((a,b)=>a+b,0);
+      if (totalTricks === 7 || (room.sittingOut >= 0 && totalTricks === 6)) {
+        resolveHand(room); return;
+      }
+
+      // Next leader — skip sitting out
+      let next = winner;
+      if (room.sittingOut === next) next = (next + 1) % 4;
+      room.currentPlayer = next;
     } else {
-      room.currentPlayer = (seat + 1) % 4;
+      // Advance to next active player
+      let next = (seat + 1) % 4;
+      if (room.sittingOut === next) next = (next + 1) % 4;
+      room.currentPlayer = next;
     }
-    broadcastRoom(room);
+    broadcast(room);
   });
 
   socket.on('nextHand', () => {
-    const found = findRoomBySocket(socket.id);
-    if (!found) return;
+    const found = findRoom(socket.id); if (!found) return;
     const { room } = found;
     if (room.state === 'hand_end') startBidding(room);
   });
 
   socket.on('disconnect', () => {
-    const found = findRoomBySocket(socket.id);
-    if (!found) return;
+    const found = findRoom(socket.id); if (!found) return;
     const { room, seat } = found;
     if (room.seats[seat]) room.seats[seat] = { ...room.seats[seat], disconnected: true };
-    broadcastRoom(room);
+    broadcast(room);
   });
 
   socket.on('rejoin', ({ code, seat, name }) => {
@@ -463,9 +1309,9 @@ io.on('connection', (socket) => {
     room.seats[seat] = { socketId: socket.id, name };
     socket.join(code.toUpperCase());
     socket.emit('joined', { code: room.code, seat, name });
-    broadcastRoom(room);
+    broadcast(room);
   });
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`42 Dominoes server running on port ${PORT}`));
+server.listen(PORT, () => console.log(`42 Dominoes running on port ${PORT}`));
