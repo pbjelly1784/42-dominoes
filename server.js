@@ -175,8 +175,8 @@ function scoreHand(bid, trickCount, pointsTaken) {
     delta[won ? bidTeam : defTeam] = bid.marks || 1;
     return delta;
   }
-  // High / follow_me
-  const won = bidTotal >= bid.amount;
+  // High / follow_me — always need 42 total points regardless of bid amount (84, 126 etc. only affect marks)
+  const won = bidTotal >= 42;
   delta[won ? bidTeam : defTeam] = bid.marks || 1;
   return delta;
 }
@@ -212,18 +212,29 @@ function getAvailableBids(highBid, hand, allBids, isDealer, forced) {
   // Plunge — needs 4+ doubles, starts at 2 marks +1 per prior plunge bid
   const plungeMarks = 2 + plungeCount;
   bids.push({
-    amount: 84, type: 'plunge', label: `Plunge (${plungeMarks} marks)`,
+    amount: 84, type: 'plunge', label: 'Plunge (4+ doubles)',
     enabled: doubles >= 4 && hAmount < 84,
     marks: plungeMarks, plungeLevel: plungeMarks
   });
 
-  // Doubling chain 126 / 168 / 210 — only after an 84 bid
+  // Doubling chain — each step only available if the previous level has been bid
+  // 126 requires 84 first, 168 requires 126 first, 210 requires 168 first
+  const any126 = allBids.some(b => b.amount >= 126 && b.type !== 'pass');
+  const any168 = allBids.some(b => b.amount >= 168 && b.type !== 'pass');
   if (any84) {
-    for (const [amt, marks] of [[126,3],[168,4],[210,5]]) {
-      bids.push({ amount: amt, type: 'high',   label: `${amt} High`,   enabled: hAmount < amt, marks });
-      bids.push({ amount: amt, type: 'low',    label: `${amt} Low`,    enabled: hAmount < amt, marks });
-      bids.push({ amount: amt, type: 'plunge', label: `${amt} Plunge`, enabled: doubles >= 4 && hAmount < amt, marks, plungeLevel: marks });
-    }
+    bids.push({ amount: 126, type: 'high',   label: '126 High',   enabled: hAmount < 126, marks: 3 });
+    bids.push({ amount: 126, type: 'low',    label: '126 Low',    enabled: hAmount < 126, marks: 3 });
+    bids.push({ amount: 126, type: 'plunge', label: '126 Plunge (4+ doubles)', enabled: doubles >= 4 && hAmount < 126, marks: 3, plungeLevel: 3 });
+  }
+  if (any126) {
+    bids.push({ amount: 168, type: 'high',   label: '168 High',   enabled: hAmount < 168, marks: 4 });
+    bids.push({ amount: 168, type: 'low',    label: '168 Low',    enabled: hAmount < 168, marks: 4 });
+    bids.push({ amount: 168, type: 'plunge', label: '168 Plunge (4+ doubles)', enabled: doubles >= 4 && hAmount < 168, marks: 4, plungeLevel: 4 });
+  }
+  if (any168) {
+    bids.push({ amount: 210, type: 'high',   label: '210 High',   enabled: hAmount < 210, marks: 5 });
+    bids.push({ amount: 210, type: 'low',    label: '210 Low',    enabled: hAmount < 210, marks: 5 });
+    bids.push({ amount: 210, type: 'plunge', label: '210 Plunge (4+ doubles)', enabled: doubles >= 4 && hAmount < 210, marks: 5, plungeLevel: 5 });
   }
 
   bids.push({ amount: 0, type: 'pass', label: 'Pass', enabled: !forced });
@@ -617,7 +628,7 @@ function renderGame(state){
   if(state.state==='playing'){
     const t1pts=(state.pointsTaken[0]||0)+(state.pointsTaken[2]||0);
     const t2pts=(state.pointsTaken[1]||0)+(state.pointsTaken[3]||0);
-    const needed=state.bid?state.bid.amount:42;
+    const needed=state.bid&&state.bid.type==='low'?0:(state.bid&&state.bid.type==='plunge'?42:42);
     const bidTeam=state.bid?(state.bid.seatIndex%2===0?1:2):0;
     pb.innerHTML=
       '<div class="pts-team"><span class="pts-label">Team 1:</span><span class="pts-val">'+t1pts+' pts</span>'+(bidTeam===1?'<span class="pts-need">need '+needed+'</span>':'')+'</div>'+
@@ -1117,7 +1128,8 @@ function isMathematicallySet(bid, trickCount, pointsTaken, hands, sittingOut) {
   const maxRemaining = remainingPipPts + tricksLeft;
   const maxPossible = bidTeamSoFar + maxRemaining;
 
-  return maxPossible < bid.amount;
+  // Win condition is always 42 points regardless of bid amount (84/126/etc. only affect marks)
+  return maxPossible < 42;
 }
 
 function resolveHand(room) {
@@ -1173,7 +1185,7 @@ io.on('connection', socket => {
 
     const label = type === 'pass' ? 'Pass'
       : type === 'low'    ? `${amount} Low`
-      : type === 'plunge' ? `Plunge (${plungeLevel||2} marks)`
+      : type === 'plunge' ? (amount <= 84 ? 'Plunge (4+ doubles)' : `${amount} Plunge (4+ doubles)`)
       : String(amount);
 
     const bidObj = { amount, type, label, marks: marks||1, plungeLevel, seatIndex: seat };
