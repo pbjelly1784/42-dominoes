@@ -151,7 +151,7 @@ function scoreHand(bid, trickCount, pointsTaken) {
 }
 
 // Build available bids for a player
-function getAvailableBids(highBid, hand, allBids) {
+function getAvailableBids(highBid, hand, allBids, isDealer, forced) {
   const hAmount = highBid ? highBid.amount : 0;
   const hType   = highBid ? highBid.type   : null;
   const any42   = allBids.some(b => b.amount >= 42 && b.type !== 'pass');
@@ -195,7 +195,7 @@ function getAvailableBids(highBid, hand, allBids) {
     }
   }
 
-  bids.push({ amount: 0, type: 'pass', label: 'Pass', enabled: true });
+  bids.push({ amount: 0, type: 'pass', label: 'Pass', enabled: !forced });
   return bids;
 }
 
@@ -404,16 +404,32 @@ input[type=text]::placeholder{color:var(--text-dim)}
 .bid-btn.pass-btn{color:#e07070;border-color:rgba(220,100,100,.3)}
 .bid-btn:disabled{opacity:.22;cursor:not-allowed;pointer-events:none}
 
-/* Trump select */
-.trump-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:7px}
-.trump-btn{
-  display:flex;flex-direction:column;align-items:center;gap:.25rem;
-  background:rgba(255,255,255,.06);border:1px solid rgba(201,168,76,.22);border-radius:9px;
-  color:var(--ivory);padding:.8rem .4rem;cursor:pointer;font-family:inherit;font-size:.76rem;transition:background .12s
+/* Trump select — same floating panel as bid menu */
+#trump-panel{
+  position:absolute;bottom:160px;left:50%;transform:translateX(-50%);
+  z-index:200;pointer-events:all;width:auto;min-width:320px;max-width:520px
 }
-.trump-btn:hover{background:rgba(201,168,76,.16);border-color:var(--gold)}
-.trump-btn.follow-me-btn{grid-column:span 2;border-color:rgba(100,180,240,.38);color:#8ecdf5}
-.trump-pip-n{width:20px;height:20px;background:var(--pip);border-radius:50%;display:flex;align-items:center;justify-content:center;color:var(--ivory);font-size:.7rem;font-weight:600}
+#trump-panel.hidden{display:none}
+#trump-panel-inner{
+  background:rgba(8,24,14,.72);border:1px solid rgba(201,168,76,.35);
+  border-radius:var(--radius);backdrop-filter:blur(2px);
+  padding:.6rem .8rem .7rem;display:flex;flex-direction:column
+}
+.trump-panel-head{
+  display:flex;align-items:center;justify-content:center;margin-bottom:.45rem
+}
+.trump-panel-head h3{font-family:'Playfair Display',serif;color:var(--gold);font-size:.9rem;margin:0}
+.trump-panel-sub{font-size:.7rem;color:var(--text-dim);text-align:center;margin-bottom:.45rem}
+.trump-grid{display:flex;flex-wrap:wrap;gap:5px;justify-content:center}
+.trump-btn{
+  background:rgba(10,30,18,.82);border:1px solid rgba(201,168,76,.28);border-radius:7px;
+  color:var(--ivory);padding:.38rem .7rem;font-family:inherit;font-size:.78rem;font-weight:500;
+  cursor:pointer;transition:background .12s,border-color .12s;white-space:nowrap;
+  display:flex;align-items:center;gap:.35rem
+}
+.trump-btn:hover{background:rgba(201,168,76,.2);border-color:var(--gold)}
+.trump-btn.follow-me-btn{border-color:rgba(100,180,240,.38);color:#8ecdf5}
+.trump-pip-n{width:18px;height:18px;background:var(--pip);border-radius:50%;display:flex;align-items:center;justify-content:center;color:var(--ivory);font-size:.65rem;font-weight:600;flex-shrink:0}
 .trump-count{font-size:.65rem;color:var(--gold)}
 
 /* Result */
@@ -458,8 +474,8 @@ input[type=text]::placeholder{color:var(--text-dim)}
   :root{--tile-w:36px;--tile-h:66px}
   .table-wrap{grid-template-columns:72px 1fr 72px;grid-template-rows:82px 1fr 138px}
   .tile-back{width:18px;height:32px}
-  .bid-grid{gap:4px}
-  #bid-panel{min-width:260px;max-width:90vw;bottom:130px}
+  .bid-grid,.trump-grid{gap:4px}
+  #bid-panel,#trump-panel{min-width:260px;max-width:90vw;bottom:130px}
 }
 `;
 
@@ -475,7 +491,7 @@ function showScreen(id){document.querySelectorAll('.screen').forEach(s=>s.classL
 function $$(id){return document.getElementById(id)}
 function showFull(id){$$(id).classList.remove('hidden')}
 function hideFull(id){$$(id).classList.add('hidden')}
-function hideAllOverlays(){['overlay-trump','overlay-hand-end','overlay-game-over'].forEach(hideFull);$$('bid-panel').classList.add('hidden')}
+function hideAllOverlays(){['overlay-hand-end','overlay-game-over'].forEach(hideFull);$$('bid-panel').classList.add('hidden');$$('trump-panel').classList.add('hidden')}
 
 // Lobby
 $$('btn-create').addEventListener('click',()=>{
@@ -568,8 +584,8 @@ function renderGame(state){
   // Points bar
   const pb=$$('points-bar');
   if(state.state==='playing'){
-    const t1pts=(state.pointsTaken[0]||0)+(state.pointsTaken[2]||0)+(state.trickCount[0]||0)+(state.trickCount[2]||0);
-    const t2pts=(state.pointsTaken[1]||0)+(state.pointsTaken[3]||0)+(state.trickCount[1]||0)+(state.trickCount[3]||0);
+    const t1pts=(state.pointsTaken[0]||0)+(state.pointsTaken[2]||0);
+    const t2pts=(state.pointsTaken[1]||0)+(state.pointsTaken[3]||0);
     const needed=state.bid?state.bid.amount:42;
     const bidTeam=state.bid?(state.bid.seatIndex%2===0?1:2):0;
     pb.innerHTML=
@@ -623,7 +639,7 @@ function renderGame(state){
   if(state.state==='bidding'&&state.currentBidder===mySeat){
     renderBidPanel(state);$$('bid-panel').classList.remove('hidden')
   } else if((state.state==='trump_select'||state.state==='plunge_trump_select')&&state.trumpSelector===mySeat){
-    renderTrumpOverlay(state);showFull('overlay-trump')
+    renderTrumpOverlay(state);$$('trump-panel').classList.remove('hidden')
   } else if(state.state==='hand_end'){
     renderHandEnd(state);showFull('overlay-hand-end')
   } else if(state.state==='game_over'){
@@ -724,14 +740,14 @@ function renderTrumpOverlay(state){
   hand.forEach(t=>{cnt[t.hi]++;if(t.hi!==t.lo)cnt[t.lo]++});
   SUIT.forEach((name,i)=>{
     const btn=document.createElement('button');btn.className='trump-btn';
-    btn.innerHTML='<div class="trump-pip-n">'+i+'</div><span>'+name+'</span><span class="trump-count">'+cnt[i]+' tiles</span>';
-    btn.addEventListener('click',()=>{socket.emit('selectTrump',{trump:i});hideFull('overlay-trump')});
+    btn.innerHTML='<div class="trump-pip-n">'+i+'</div><span>'+name+'</span><span class="trump-count">('+cnt[i]+')</span>';
+    btn.addEventListener('click',()=>{socket.emit('selectTrump',{trump:i});$$('trump-panel').classList.add('hidden')});
     grid.appendChild(btn)
   });
   if(state.bidType==='high'){
     const fm=document.createElement('button');fm.className='trump-btn follow-me-btn';
-    fm.innerHTML='<span style="font-size:.9rem">&#9733;</span><span>Follow Me</span><span class="trump-count">Lead sets trump</span>';
-    fm.addEventListener('click',()=>{socket.emit('selectTrump',{trump:-1,followMe:true});hideFull('overlay-trump')});
+    fm.innerHTML='<span>&#9733;</span><span>Follow Me</span>';
+    fm.addEventListener('click',()=>{socket.emit('selectTrump',{trump:-1,followMe:true});$$('trump-panel').classList.add('hidden')});
     grid.appendChild(fm)
   }
   $$('trump-card-title').textContent=state.state==='plunge_trump_select'?'Partner: Pick Trump':'Select Trump'
@@ -875,11 +891,13 @@ function getHTML() {
     </div>
   </div>
 
-  <!-- Trump select -->
-  <div id="overlay-trump" class="overlay-full hidden">
-    <div class="overlay-full-card">
-      <h3 id="trump-card-title">Select Trump</h3>
-      <p class="bid-subtitle">Choose the trump suit for this hand</p>
+  <!-- Trump select panel (same style as bid panel) -->
+  <div id="trump-panel" class="hidden">
+    <div id="trump-panel-inner">
+      <div class="trump-panel-head">
+        <h3 id="trump-card-title">Select Trump</h3>
+      </div>
+      <div class="trump-panel-sub">Choose the trump suit — your hand tiles shown per suit</div>
       <div class="trump-grid" id="trump-buttons"></div>
     </div>
   </div>
@@ -951,7 +969,7 @@ function broadcast(room) {
     const seat = room.seats[i];
     if (!seat || seat.disconnected) continue;
     const availableBids = (room.state === 'bidding' && room.currentBidder === i)
-      ? getAvailableBids(room.bid, room.hands[i], room.bids) : [];
+      ? getAvailableBids(room.bid, room.hands[i], room.bids, i === room.dealer, dealerForced(room)) : [];
     io.to(seat.socketId).emit('state', { ...pubRoom(room), myHand: room.hands[i], mySeat: i, availableBids });
   }
 }
@@ -979,15 +997,17 @@ function startBidding(room) {
 }
 
 function advanceBidder(room) {
-  const passed = new Set(room.bids.filter(b=>b.type==='pass').map(b=>b.seatIndex));
-  let next = (room.currentBidder + 1) % 4, loops = 0;
-  while (passed.has(next) && loops++ < 4) next = (next+1)%4;
-  room.currentBidder = next;
+  room.currentBidder = (room.currentBidder + 1) % 4;
 }
 
 function biddingDone(room) {
-  const passed = new Set(room.bids.filter(b=>b.type==='pass').map(b=>b.seatIndex));
-  return [0,1,2,3].filter(i=>!passed.has(i)).length === 1 || room.bid.type === 'plunge';
+  if (room.bid.type === 'plunge') return true;
+  return room.bids.length === 4;
+}
+
+function dealerForced(room) {
+  if (room.currentBidder !== room.dealer) return false;
+  return room.bids.filter(b => b.type !== 'pass').length === 0;
 }
 
 function openTrumpSelect(room) {
@@ -1080,23 +1100,20 @@ io.on('connection', socket => {
 
     const bidObj = { amount, type, label, marks: marks||1, plungeLevel, seatIndex: seat };
 
-    if (type === 'pass') {
-      room.bids.push(bidObj);
-      const passed = room.bids.filter(b=>b.type==='pass').length;
-      // Check if only one non-passer remains
-      if (biddingDone(room)) { openTrumpSelect(room); return; }
-      // All 4 passed with no bid — dealer forced to 30
-      if (passed === 4) {
-        room.bid = { amount:30, type:'high', label:'30 (forced)', marks:1, seatIndex:room.dealer };
-        room.bids.push(room.bid); openTrumpSelect(room); return;
+    room.bids.push(bidObj);
+    if (type !== 'pass') room.bid = bidObj;
+
+    if (biddingDone(room)) {
+      // All 4 acted — find the winner
+      if (room.bid.amount === 0 || room.bid.type === null) {
+        // Everyone passed (shouldn't happen but safety): dealer forced, send back for input
+        room.bid = { amount: 0, type: null, label: '', marks: 0 };
+        room.currentBidder = room.dealer;
+        broadcast(room); return;
       }
-      advanceBidder(room);
-      broadcast(room); return;
+      openTrumpSelect(room); return;
     }
 
-    room.bid = bidObj;
-    room.bids.push(bidObj);
-    if (biddingDone(room)) { openTrumpSelect(room); return; }
     advanceBidder(room);
     broadcast(room);
   });
