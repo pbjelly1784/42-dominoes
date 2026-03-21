@@ -71,14 +71,18 @@ function trickWinner(plays, trump, isLow) {
 
   if (isLow) {
     // 42 Low: no trump, doubles are their own suit
+    // A tile is "in suit" if: led suit is 'double' and tile is double,
+    // OR led suit is a number and tile is non-double with that number on either end
     const ledSuit = lowSuitOf(leadTile);
+    function inLowSuit(t) {
+      if (ledSuit === 'double') return isDouble(t);
+      return !isDouble(t) && (t.hi === ledSuit || t.lo === ledSuit);
+    }
     let best = plays[0];
     for (let i = 1; i < plays.length; i++) {
       const p = plays[i];
-      const pSuit = lowSuitOf(p.tile);
-      const bestSuit = lowSuitOf(best.tile);
-      if (pSuit === ledSuit) {
-        if (bestSuit !== ledSuit) {
+      if (inLowSuit(p.tile)) {
+        if (!inLowSuit(best.tile)) {
           best = p; // challenger follows suit, current best doesn't
         } else {
           // Both follow led suit — higher strength wins
@@ -121,12 +125,17 @@ function isLegalPlay(tile, hand, trick, trump, bidType, trickTrump) {
   const leadTile = trick[0].tile;
 
   if (bidType === 'low') {
-    // 42 Low: doubles are their own suit, non-doubles follow high end
-    const ledSuit = lowSuitOf(leadTile);
-    const tileInSuit = lowSuitOf(tile) === ledSuit;
-    const canFollow = hand.some(t => lowSuitOf(t) === ledSuit);
+    // 42 Low: doubles are their own suit; non-doubles follow if EITHER end matches led suit
+    const ledSuit = lowSuitOf(leadTile); // hi end of lead, or 'double'
+    // A non-double tile follows if either end matches the led suit number
+    const tileFollows = isDouble(tile)
+      ? ledSuit === 'double'
+      : ledSuit !== 'double' && (tile.hi === ledSuit || tile.lo === ledSuit);
+    const canFollow = hand.some(t =>
+      isDouble(t) ? ledSuit === 'double' : ledSuit !== 'double' && (t.hi === ledSuit || t.lo === ledSuit)
+    );
     if (!canFollow) return true;
-    return tileInSuit;
+    return tileFollows;
   }
 
   const effectiveTrump = bidType === 'follow_me' ? trickTrump : trump;
@@ -675,10 +684,10 @@ function legalClient(tile,hand,trick,trump,bidType,trickTrump){
   const leadTile=trick[0].tile;
   if(bidType==='low'){
     const ls=lowSuitOf(leadTile);
-    const tileInSuit=lowSuitOf(tile)===ls;
-    const canFollow=hand.some(t=>lowSuitOf(t)===ls);
+    const tileFollows=ls==='double'?(tile.hi===tile.lo):(tile.hi!==tile.lo&&(tile.hi===ls||tile.lo===ls));
+    const canFollow=hand.some(t=>ls==='double'?(t.hi===t.lo):(t.hi!==t.lo&&(t.hi===ls||t.lo===ls)));
     if(!canFollow)return true;
-    return tileInSuit;
+    return tileFollows;
   }
   const et=bidType==='follow_me'?trickTrump:trump;
   if(et===null||et===undefined){
@@ -794,8 +803,15 @@ function renderHandEnd(state){
   $$('result-title').textContent=last.made?bt+' made it!':bt+' was set!';
   const wt=last.delta[0]>0?'Team 1':'Team 2';
   const marks=Math.max(last.delta[0],last.delta[1]);
+  let reasonHtml='';
+  if(last.earlyEndReason==='mathematically_set'){
+    reasonHtml='<p style="margin-top:.4rem;font-size:.78rem;color:#e07070">'+bt+' could no longer reach their bid — hand ended early</p>';
+  } else if(last.earlyEndReason==='bidder_took_trick'){
+    reasonHtml='<p style="margin-top:.4rem;font-size:.78rem;color:#e07070">Bidder took a trick — 42 Low lost immediately</p>';
+  }
   $$('result-body').innerHTML=
     '<p class="'+(last.made?'result-made':'result-set')+'">'+(last.made?'✓':'✗')+' Bid: '+last.bid.label+' · '+(last.made?'Made':'Set')+'</p>'+
+    reasonHtml+
     '<p style="margin-top:.5rem">'+wt+' gets '+marks+' mark'+(marks!==1?'s':'')+'</p>'+
     '<p style="margin-top:.5rem">Score — Team 1: <strong>'+state.score[0]+'</strong> · Team 2: <strong>'+state.score[1]+'</strong></p>'+
     '<p style="margin-top:.3rem;font-size:.76rem;color:var(--text-dim)">First to 7 marks wins</p>'
@@ -977,7 +993,7 @@ const rooms = new Map();
 
 function makeRoom(code) {
   return {
-    code, seats: [null,null,null,null], state: 'lobby',
+    code, seats: [null,null,null,null], state: 'lobby', earlyEndReason: null,
     hands: [[],[],[],[]], bid: null, bids: [],
     currentBidder: 0, trump: null, bidType: null,
     trickTrump: null, trumpSelector: -1, sittingOut: -1,
@@ -995,7 +1011,7 @@ function pubRoom(room) {
     trumpSelector: room.trumpSelector, sittingOut: room.sittingOut,
     trick: room.trick, trickCount: room.trickCount, pointsTaken: room.pointsTaken,
     currentPlayer: room.currentPlayer, score: room.score, dealer: room.dealer,
-    lastTrick: room.lastTrick, handHistory: room.handHistory, boneyard: room.boneyard,
+    lastTrick: room.lastTrick, handHistory: room.handHistory, boneyard: room.boneyard, earlyEndReason: room.earlyEndReason,
   };
 }
 
@@ -1025,7 +1041,7 @@ function startBidding(room) {
   room.trump = null; room.bidType = null; room.trickTrump = null;
   room.trumpSelector = -1; room.sittingOut = -1;
   room.trick = []; room.trickCount = [0,0,0,0]; room.pointsTaken = [0,0,0,0];
-  room.lastTrick = null; room.boneyard = [];   // reset boneyard each hand
+  room.lastTrick = null; room.boneyard = []; room.earlyEndReason = null;   // reset each hand
   room.currentBidder = (room.dealer + 1) % 4;
   room.state = 'bidding';
   broadcast(room);
@@ -1036,7 +1052,7 @@ function advanceBidder(room) {
 }
 
 function biddingDone(room) {
-  if (room.bid.type === 'plunge') return true;
+  // Bidding ends after all 4 players have acted — no auto-win on plunge
   return room.bids.length === 4;
 }
 
@@ -1077,11 +1093,38 @@ function startPlay(room, trump, followMe) {
   broadcast(room);
 }
 
+
+// Check if the bidding team is already mathematically set (cannot reach bid)
+// Returns true if the hand should end early
+function isMathematicallySet(bid, trickCount, pointsTaken, hands, sittingOut) {
+  if (bid.type !== 'high' && bid.type !== 'follow_me') return false; // only for high bids
+
+  const bidTeam = bid.seatIndex % 2;
+  const teamPts = [pointsTaken[0]+pointsTaken[2], pointsTaken[1]+pointsTaken[3]];
+  const teamTricks = [trickCount[0]+trickCount[2], trickCount[1]+trickCount[3]];
+  const bidTeamSoFar = teamPts[bidTeam] + teamTricks[bidTeam];
+
+  // Count remaining points in unplayed tiles
+  const activeTiles = [];
+  for (let s = 0; s < 4; s++) {
+    if (s !== sittingOut) hands[s].forEach(t => activeTiles.push(t));
+  }
+  const remainingPipPts = activeTiles.reduce((sum, t) => {
+    const sc = t.hi + t.lo;
+    return sum + ((sc === 5 || sc === 10) ? sc : 0);
+  }, 0);
+  const tricksLeft = activeTiles.length / (sittingOut >= 0 ? 3 : 4);
+  const maxRemaining = remainingPipPts + tricksLeft;
+  const maxPossible = bidTeamSoFar + maxRemaining;
+
+  return maxPossible < bid.amount;
+}
+
 function resolveHand(room) {
   const delta = scoreHand(room.bid, room.trickCount, room.pointsTaken);
   room.score[0] += delta[0]; room.score[1] += delta[1];
   const bidTeam = room.bid.seatIndex % 2;
-  room.handHistory.push({ bid: room.bid, delta, score: [...room.score], bidTeam, made: delta[bidTeam] > 0 });
+  room.handHistory.push({ bid: room.bid, delta, score: [...room.score], bidTeam, made: delta[bidTeam] > 0, earlyEndReason: room.earlyEndReason });
   room.state = room.score[0] >= 7 || room.score[1] >= 7 ? 'game_over' : 'hand_end';
   room.dealer = (room.dealer + 1) % 4;
   broadcast(room);
@@ -1204,13 +1247,18 @@ io.on('connection', socket => {
 
       // 42 Low: if BIDDER takes a trick, hand ends immediately (bidder loses)
       if (room.bidType === 'low' && winner === room.bid.seatIndex) {
+        room.earlyEndReason = 'bidder_took_trick';
         resolveHand(room); return;
       }
 
       const totalTricks = room.trickCount.reduce((a,b)=>a+b,0);
-      const maxTricks = active.length === 3 ? 6 : 7; // 6 tricks when someone sits out (3 players × ... no, still 7 tiles each but 3 active = 7 tricks total from those hands)
-      // Actually with 3 active players each has 7 tiles so 7 tricks total
       if (totalTricks === 7) { resolveHand(room); return; }
+
+      // Check if bidding team is mathematically set (cannot reach their bid)
+      if (isMathematicallySet(room.bid, room.trickCount, room.pointsTaken, room.hands, room.sittingOut)) {
+        room.earlyEndReason = 'mathematically_set';
+        resolveHand(room); return;
+      }
 
       // Next leader = winner (skip sitting out — winner can't be sittingOut)
       room.currentPlayer = winner;
