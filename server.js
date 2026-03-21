@@ -373,37 +373,36 @@ input[type=text]::placeholder{color:var(--text-dim)}
 .overlay-full-card h3{font-family:'Playfair Display',serif;color:var(--gold);font-size:1.3rem;text-align:center}
 .bid-subtitle{text-align:center;font-size:.8rem;color:var(--text-dim)}
 
-/* Bid panel — right side drawer */
+/* Bid panel — compact centered floating overlay */
 #bid-panel{
-  position:absolute;top:0;right:0;bottom:0;width:200px;z-index:200;
-  display:flex;flex-direction:column;pointer-events:none
+  position:absolute;bottom:160px;left:50%;transform:translateX(-50%);
+  z-index:200;pointer-events:all;width:auto;min-width:320px;max-width:520px
 }
 #bid-panel.hidden{display:none}
 #bid-panel-inner{
-  margin:auto 0;background:#0b2016;border:1px solid var(--card-border);
-  border-right:none;border-radius:var(--radius) 0 0 var(--radius);
-  display:flex;flex-direction:column;max-height:90vh;pointer-events:all
+  background:rgba(8,24,14,.72);border:1px solid rgba(201,168,76,.35);
+  border-radius:var(--radius);backdrop-filter:blur(2px);
+  display:flex;flex-direction:column;padding:.6rem .8rem .7rem
 }
 .bid-panel-head{
-  padding:.6rem .9rem .4rem;display:flex;align-items:center;justify-content:space-between;
-  border-bottom:1px solid rgba(201,168,76,.15);flex-shrink:0
+  display:flex;align-items:center;justify-content:center;gap:.6rem;
+  margin-bottom:.45rem;flex-shrink:0
 }
-.bid-panel-head h3{font-family:'Playfair Display',serif;color:var(--gold);font-size:.95rem}
-.bid-toggle{background:none;border:none;color:var(--gold);font-size:1rem;cursor:pointer;line-height:1;padding:0 .2rem}
-.bid-panel-sub{font-size:.72rem;color:var(--text-dim);padding:.3rem .9rem 0;flex-shrink:0}
-.bid-panel-body{overflow-y:auto;padding:.5rem .7rem .8rem;flex:1}
-.bid-grid{display:flex;flex-direction:column;gap:5px}
+.bid-panel-head h3{font-family:'Playfair Display',serif;color:var(--gold);font-size:.9rem;margin:0}
+.bid-panel-sub{font-size:.7rem;color:var(--text-dim);text-align:center;margin-bottom:.45rem;flex-shrink:0}
+.bid-panel-body{overflow:visible}
+.bid-grid{display:flex;flex-wrap:wrap;gap:5px;justify-content:center}
 .bid-btn{
-  background:rgba(255,255,255,.06);border:1px solid rgba(201,168,76,.22);border-radius:7px;
-  color:var(--ivory);padding:.42rem .6rem;font-family:inherit;font-size:.8rem;font-weight:500;
-  cursor:pointer;transition:background .12s,border-color .12s;text-align:left;width:100%
+  background:rgba(10,30,18,.82);border:1px solid rgba(201,168,76,.28);border-radius:7px;
+  color:var(--ivory);padding:.38rem .7rem;font-family:inherit;font-size:.78rem;font-weight:500;
+  cursor:pointer;transition:background .12s,border-color .12s;text-align:center;white-space:nowrap
 }
-.bid-btn:hover:not(:disabled){background:rgba(201,168,76,.16);border-color:var(--gold)}
-.bid-btn.low-btn{color:#a8e6cf;border-color:rgba(100,220,170,.28)}
-.bid-btn.plunge-btn{color:var(--gold);border-color:rgba(201,168,76,.45)}
-.bid-btn.double-btn{color:#8ecdf5;border-color:rgba(100,180,240,.28)}
-.bid-btn.pass-btn{color:#e07070;border-color:rgba(220,100,100,.28)}
-.bid-btn:disabled{opacity:.25;cursor:not-allowed;pointer-events:none}
+.bid-btn:hover:not(:disabled){background:rgba(201,168,76,.2);border-color:var(--gold)}
+.bid-btn.low-btn{color:#a8e6cf;border-color:rgba(100,220,170,.3)}
+.bid-btn.plunge-btn{color:var(--gold);border-color:rgba(201,168,76,.5)}
+.bid-btn.double-btn{color:#8ecdf5;border-color:rgba(100,180,240,.3)}
+.bid-btn.pass-btn{color:#e07070;border-color:rgba(220,100,100,.3)}
+.bid-btn:disabled{opacity:.22;cursor:not-allowed;pointer-events:none}
 
 /* Trump select */
 .trump-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:7px}
@@ -459,8 +458,8 @@ input[type=text]::placeholder{color:var(--text-dim)}
   :root{--tile-w:36px;--tile-h:66px}
   .table-wrap{grid-template-columns:72px 1fr 72px;grid-template-rows:82px 1fr 138px}
   .tile-back{width:18px;height:32px}
-  #bid-panel{width:160px}
   .bid-grid{gap:4px}
+  #bid-panel{min-width:260px;max-width:90vw;bottom:130px}
 }
 `;
 
@@ -469,7 +468,7 @@ input[type=text]::placeholder{color:var(--text-dim)}
 const CLIENT_JS = `
 'use strict';
 const socket=io();
-let myName='',myRoom='',mySeat=-1,lastState=null,boneyardOpen=false,bidPanelOpen=true;
+let myName='',myRoom='',mySeat=-1,lastState=null,boneyardOpen=false;
 const SUIT=['Blanks','Ones','Twos','Threes','Fours','Fives','Sixes'];
 
 function showScreen(id){document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active'));document.getElementById(id).classList.add('active')}
@@ -497,13 +496,6 @@ $$('btn-start').addEventListener('click',()=>socket.emit('startGame'));
 $$('btn-next-hand').addEventListener('click',()=>{socket.emit('nextHand');hideFull('overlay-hand-end')});
 $$('btn-play-again').addEventListener('click',()=>location.reload());
 function setErr(id,msg){$$(id).textContent=msg}
-
-// Bid panel toggle
-$$('bid-toggle').addEventListener('click',()=>{
-  bidPanelOpen=!bidPanelOpen;
-  $$('bid-panel-body').style.display=bidPanelOpen?'':'none';
-  $$('bid-toggle').textContent=bidPanelOpen?'▶':'◀'
-});
 
 // Boneyard
 $$('boneyard-tab').addEventListener('click',()=>{
@@ -874,10 +866,8 @@ function getHTML() {
     <div id="bid-panel" class="hidden">
       <div id="bid-panel-inner">
         <div class="bid-panel-head">
-          <h3>Your Bid</h3>
-          <button class="bid-toggle" id="bid-toggle">&#9654;</button>
+          <h3>Your Bid &mdash; <span id="bid-panel-sub" style="font-size:.78rem;font-weight:400;color:var(--text-dim)">Current: None</span></h3>
         </div>
-        <div class="bid-panel-sub" id="bid-panel-sub">Current: None</div>
         <div class="bid-panel-body" id="bid-panel-body">
           <div class="bid-grid" id="bid-buttons"></div>
         </div>
