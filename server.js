@@ -262,6 +262,335 @@ function getAvailableBids(highBid, hand, allBids, isDealer, forced) {
   return bids;
 }
 
+
+// ─── Bot Logic ────────────────────────────────────────────────────────────────
+
+const BOT_NAMES = ['Duke', 'Tex', 'Rosie', 'Slim', 'Buck', 'Pearl'];
+const BOT_THINK_MS = { min: 800, max: 1800 };
+
+function botDelay() {
+  return BOT_THINK_MS.min + Math.floor(Math.random() * (BOT_THINK_MS.max - BOT_THINK_MS.min));
+}
+
+// Count scoring tiles in a hand
+function countPipTiles(hand) {
+  return hand.filter(t => tileScore(t) > 0).length;
+}
+
+function totalPipPoints(hand) {
+  return hand.reduce((s, t) => s + tileScore(t), 0);
+}
+
+// Highest tile in a hand by overall strength
+function strongestTile(hand) {
+  return hand.reduce((best, t) => tileStrength(t) > tileStrength(best) ? t : best, hand[0]);
+}
+
+function weakestTile(hand) {
+  return hand.reduce((weak, t) => tileStrength(t) < tileStrength(weak) ? t : weak, hand[0]);
+}
+
+// Tiles that follow the led suit (legal plays that stay in suit)
+function inSuitTiles(hand, ledSuit, trump, bidType) {
+  if (bidType === 'low') {
+    return hand.filter(t => {
+      if (ledSuit === 'double') return isDouble(t);
+      return !isDouble(t) && (t.hi === ledSuit || t.lo === ledSuit);
+    });
+  }
+  if (trump !== null && trump !== undefined) {
+    return hand.filter(t => !isTrump(t, trump) && (t.hi === ledSuit || t.lo === ledSuit));
+  }
+  return hand.filter(t => t.hi === ledSuit || t.lo === ledSuit);
+}
+
+function trumpTiles(hand, trump) {
+  return hand.filter(t => isTrump(t, trump));
+}
+
+// Strength of tile within the led suit (non-led end is power)
+function tileInSuitStrength(tile, ledSuit) {
+  if (isDouble(tile)) return 100 + tile.hi;
+  if (tile.hi === ledSuit) return tile.lo;
+  return tile.hi;
+}
+
+// ── Bot Bidding ───────────────────────────────────────────────────────────────
+
+function botChooseBid(availableBids, hand, allBids, seatIndex) {
+  const pips = totalPipPoints(hand);
+  const pipCount = countPipTiles(hand);
+  const doubles = hand.filter(t => isDouble(t)).length;
+  const highTiles = hand.filter(t => Math.max(t.hi, t.lo) >= 5).length;
+
+  // Plunge if 4+ doubles and it's available/enabled
+  const plungeBid = availableBids.find(b => b.type === 'plunge' && b.enabled && b.amount === 84);
+  if (doubles >= 4 && plungeBid) return plungeBid;
+
+  // Calculate a reasonable bid amount based on hand strength
+  // Score: pip points + 1 per high tile
+  const handStrength = pips + highTiles;
+
+  let targetBid = 0;
+  if (handStrength >= 30) targetBid = 42;
+  else if (handStrength >= 22) targetBid = 38;
+  else if (handStrength >= 16) targetBid = 35;
+  else if (handStrength >= 10) targetBid = 32;
+  else if (handStrength >= 5)  targetBid = 30;
+  else targetBid = 0; // pass
+
+  if (targetBid === 0) {
+    // Check if forced (pass not available)
+    const passBid = availableBids.find(b => b.type === 'pass');
+    if (passBid && passBid.enabled) return passBid;
+    // Forced to bid — pick lowest available
+    const lowestHigh = availableBids.filter(b => b.type === 'high' && b.enabled)
+      .sort((a, b) => a.amount - b.amount)[0];
+    return lowestHigh || availableBids.find(b => b.enabled);
+  }
+
+  // Find the highest enabled bid at or below target
+  const highBids = availableBids
+    .filter(b => b.type === 'high' && b.enabled && b.amount <= targetBid)
+    .sort((a, b) => b.amount - a.amount);
+
+  if (highBids.length > 0) return highBids[0];
+
+  // If target is below the current high bid, pass
+  const passBid = availableBids.find(b => b.type === 'pass');
+  if (passBid && passBid.enabled) return passBid;
+
+  // Forced — bid lowest available
+  const lowestEnabled = availableBids.filter(b => b.enabled && b.type !== 'pass')
+    .sort((a, b) => a.amount - b.amount)[0];
+  return lowestEnabled || availableBids[0];
+}
+
+// ── Bot Trump Selection ───────────────────────────────────────────────────────
+
+function botChooseTrump(hand) {
+  // Count tiles per suit (both ends), weighted by tile strength
+  const suitScore = Array(7).fill(0);
+  hand.forEach(t => {
+    const score = tileStrength(t) + (tileScore(t) > 0 ? 5 : 0); // bonus for count tiles
+    suitScore[t.hi] += score;
+    if (t.hi !== t.lo) suitScore[t.lo] += score;
+  });
+  // Pick suit with highest score
+  let best = 0;
+  for (let i = 1; i < 7; i++) {
+    if (suitScore[i] > suitScore[best]) best = i;
+  }
+  return best;
+}
+
+// ── Bot Tile Play ─────────────────────────────────────────────────────────────
+
+function botChooseTile(hand, trick, trump, bidType, trickTrump, seatIndex, bid) {
+  const effectiveTrump = bidType === 'follow_me' ? trickTrump : trump;
+  const isLow = bidType === 'low';
+  const isBidder = bid && bid.seatIndex === seatIndex;
+  const bidTeam = bid ? bid.seatIndex % 2 : -1;
+  const myTeam = seatIndex % 2;
+  const onBidTeam = myTeam === bidTeam;
+
+  // Filter to legal plays only
+  const legal = hand.filter(t => isLegalPlay(t, hand, trick, trump, bidType, trickTrump));
+
+  if (legal.length === 1) return legal[0];
+
+  // ── 42 Low strategy ──
+  if (isLow) {
+    if (isBidder) {
+      // Bidder wants to LOSE all tricks — lead/play lowest possible
+      return legal.reduce((w, t) => tileStrength(t) < tileStrength(w) ? t : w, legal[0]);
+    } else {
+      // Opponent wants to FORCE bidder to win
+      if (trick.length === 0) {
+        // Lead a suit bidder likely has to force them to win
+        // Lead highest tile to make bidder play high
+        return legal.reduce((w, t) => tileStrength(t) > tileStrength(w) ? t : w, legal[0]);
+      }
+      // Try to play low so bidder has to take the trick
+      return legal.reduce((w, t) => tileStrength(t) < tileStrength(w) ? t : w, legal[0]);
+    }
+  }
+
+  // ── Normal / high strategy ──
+  if (trick.length === 0) {
+    // Leading a trick
+    if (onBidTeam) {
+      // Lead count tiles if we have strong suit coverage, else lead strong suit
+      const countTiles = legal.filter(t => tileScore(t) > 0);
+      if (countTiles.length > 0 && hand.length <= 4) {
+        // Late game — lead count to capture points
+        return countTiles.reduce((w, t) => tileStrength(t) > tileStrength(w) ? t : w, countTiles[0]);
+      }
+      // Lead strongest non-count tile (establish suit control)
+      const nonCount = legal.filter(t => tileScore(t) === 0);
+      if (nonCount.length > 0) {
+        return nonCount.reduce((w, t) => tileStrength(t) > tileStrength(w) ? t : w, nonCount[0]);
+      }
+    } else {
+      // Defense: lead lowest to avoid giving points
+      return legal.reduce((w, t) => tileStrength(t) < tileStrength(w) ? t : w, legal[0]);
+    }
+    return legal[0];
+  }
+
+  // Following a trick
+  const leadTile = trick[0].tile;
+  const leadIsTrump = effectiveTrump !== null && effectiveTrump !== undefined && isTrump(leadTile, effectiveTrump);
+  const ledSuit = leadIsTrump ? effectiveTrump : leadTile.hi;
+
+  // Determine current winning play
+  const currentWinner = trickWinner(trick, effectiveTrump, isLow);
+  const currentWinnerTeam = currentWinner % 2;
+  const weAreWinning = currentWinnerTeam === myTeam;
+
+  // Points in this trick so far
+  const trickPts = trick.reduce((s, p) => s + tileScore(p.tile), 0);
+  const worthFighting = trickPts > 0 || trick.some(p => tileScore(p.tile) > 0);
+
+  const inSuit = legal.filter(t => {
+    if (leadIsTrump) return isTrump(t, effectiveTrump);
+    return !isTrump(t, effectiveTrump) && (t.hi === ledSuit || t.lo === ledSuit);
+  });
+  const trumpInHand = legal.filter(t => effectiveTrump !== null && effectiveTrump !== undefined && isTrump(t, effectiveTrump));
+  const offSuit = legal.filter(t => !isTrump(t, effectiveTrump) && !(t.hi === ledSuit || t.lo === ledSuit));
+
+  if (onBidTeam) {
+    // Try to win valuable tricks
+    if (inSuit.length > 0) {
+      if (weAreWinning && worthFighting) {
+        // Partner winning a count trick — play low to not waste
+        return inSuit.reduce((w, t) => tileInSuitStrength(t, ledSuit) < tileInSuitStrength(w, ledSuit) ? t : w, inSuit[0]);
+      }
+      if (!weAreWinning && worthFighting) {
+        // Try to beat current winner
+        const canWin = inSuit.filter(t => tileInSuitStrength(t, ledSuit) > tileInSuitStrength(trick[trick.length-1].tile, ledSuit));
+        if (canWin.length > 0) return canWin.reduce((w, t) => tileInSuitStrength(t, ledSuit) > tileInSuitStrength(w, ledSuit) ? t : w, canWin[0]);
+      }
+      // Play lowest in suit
+      return inSuit.reduce((w, t) => tileInSuitStrength(t, ledSuit) < tileInSuitStrength(w, ledSuit) ? t : w, inSuit[0]);
+    }
+    if (!weAreWinning && worthFighting && trumpInHand.length > 0) {
+      // Trump in to win count tile
+      return trumpInHand.reduce((w, t) => tileStrength(t) < tileStrength(w) ? t : w, trumpInHand[0]);
+    }
+    // Discard lowest off-suit non-count tile
+    const dump = (offSuit.length > 0 ? offSuit : legal).filter(t => tileScore(t) === 0);
+    if (dump.length > 0) return dump.reduce((w, t) => tileStrength(t) < tileStrength(w) ? t : w, dump[0]);
+    return legal.reduce((w, t) => tileStrength(t) < tileStrength(w) ? t : w, legal[0]);
+  } else {
+    // Defense — try to win tricks away from bidding team
+    if (inSuit.length > 0) {
+      if (!weAreWinning) {
+        // Try to beat
+        const canWin = inSuit.filter(t => tileInSuitStrength(t, ledSuit) > tileInSuitStrength(trick[trick.length-1].tile, ledSuit));
+        if (canWin.length > 0) return canWin.reduce((w, t) => tileInSuitStrength(t, ledSuit) > tileInSuitStrength(w, ledSuit) ? t : w, canWin[0]);
+      }
+      // Play low
+      return inSuit.reduce((w, t) => tileInSuitStrength(t, ledSuit) < tileInSuitStrength(w, ledSuit) ? t : w, inSuit[0]);
+    }
+    // Discard lowest non-count
+    const dump = legal.filter(t => tileScore(t) === 0);
+    if (dump.length > 0) return dump.reduce((w, t) => tileStrength(t) < tileStrength(w) ? t : w, dump[0]);
+    return legal.reduce((w, t) => tileStrength(t) < tileStrength(w) ? t : w, legal[0]);
+  }
+}
+
+// ── Trigger bot actions ───────────────────────────────────────────────────────
+
+function scheduleBotAction(room) {
+  const state = room.state;
+
+  if (state === 'bidding') {
+    const seat = room.currentBidder;
+    if (!room.seats[seat] || !room.seats[seat].isBot) return;
+    setTimeout(() => {
+      if (room.state !== 'bidding' || room.currentBidder !== seat) return;
+      const available = getAvailableBids(room.bid, room.hands[seat], room.bids, seat === room.dealer, dealerForced(room));
+      const chosen = botChooseBid(available, room.hands[seat], room.bids, seat);
+      const label = chosen.type === 'pass' ? 'Pass'
+        : chosen.type === 'low'    ? `${chosen.amount} Low`
+        : chosen.type === 'plunge' ? (chosen.amount <= 84 ? 'Plunge (4+ doubles)' : `${chosen.amount} Plunge (4+ doubles)`)
+        : String(chosen.amount);
+      const bidObj = { amount: chosen.amount, type: chosen.type, label, marks: chosen.marks || 1, plungeLevel: chosen.plungeLevel, seatIndex: seat };
+      room.bids.push(bidObj);
+      if (chosen.type !== 'pass') room.bid = bidObj;
+      if (biddingDone(room)) { openTrumpSelect(room); return; }
+      advanceBidder(room);
+      broadcast(room);
+      scheduleBotAction(room);
+    }, botDelay());
+
+  } else if (state === 'trump_select' || state === 'plunge_trump_select') {
+    const seat = room.trumpSelector;
+    if (!room.seats[seat] || !room.seats[seat].isBot) return;
+    setTimeout(() => {
+      if (room.state !== 'trump_select' && room.state !== 'plunge_trump_select') return;
+      if (room.trumpSelector !== seat) return;
+      const trump = botChooseTrump(room.hands[seat]);
+      startPlay(room, trump, false);
+      scheduleBotAction(room);
+    }, botDelay());
+
+  } else if (state === 'playing') {
+    const seat = room.currentPlayer;
+    if (room.trickJustResolved) return; // waiting for delay
+    if (!room.seats[seat] || !room.seats[seat].isBot) return;
+    if (room.sittingOut === seat) return;
+    setTimeout(() => {
+      if (room.state !== 'playing' || room.currentPlayer !== seat || room.trickJustResolved) return;
+      const hand = room.hands[seat];
+      const tile = botChooseTile(hand, room.trick, room.trump, room.bidType, room.trickTrump, seat, room.bid);
+      if (!tile) return;
+      const idx = hand.findIndex(t => t.id === tile.id);
+      if (idx === -1) return;
+
+      if (room.bidType === 'follow_me' && room.trick.length === 0) room.trickTrump = tile.hi;
+      hand.splice(idx, 1);
+      room.trick.push({ seatIndex: seat, tile });
+
+      const active = [0,1,2,3].filter(s => s !== room.sittingOut);
+      if (room.trick.length === active.length) {
+        const et = room.bidType === 'follow_me' ? room.trickTrump : room.trump;
+        const winner = trickWinner(room.trick, et, room.bidType === 'low');
+        const pts = room.trick.reduce((s, p) => s + tileScore(p.tile), 0) + 1;
+        room.pointsTaken[winner] += pts;
+        room.trickCount[winner]++;
+        room.boneyard.push(...room.trick.map(p => p.tile));
+        room.lastTrick = { plays: [...room.trick], winner };
+        room.trickJustResolved = true;
+        broadcast(room);
+
+        const totalTricks = room.trickCount.reduce((a,b)=>a+b,0);
+        const lowLost = room.bidType === 'low' && winner === room.bid.seatIndex;
+        const mathSet = isMathematicallySet(room.bid, room.trickCount, room.pointsTaken, room.hands, room.sittingOut);
+
+        setTimeout(() => {
+          room.trick = [];
+          room.trickTrump = null;
+          room.trickJustResolved = false;
+          if (lowLost) { room.earlyEndReason = 'bidder_took_trick'; resolveHand(room); return; }
+          if (totalTricks === 7) { resolveHand(room); return; }
+          if (mathSet) { room.earlyEndReason = 'mathematically_set'; resolveHand(room); return; }
+          room.currentPlayer = winner;
+          broadcast(room);
+          scheduleBotAction(room);
+        }, 4000);
+      } else {
+        let next = (seat + 1) % 4;
+        if (next === room.sittingOut) next = (next + 1) % 4;
+        room.currentPlayer = next;
+        broadcast(room);
+        scheduleBotAction(room);
+      }
+    }, botDelay());
+  }
+}
+
 // ─── CSS ──────────────────────────────────────────────────────────────────────
 
 const CSS = `
@@ -315,6 +644,9 @@ input[type=text]::placeholder{color:var(--text-dim)}
   letter-spacing:.18em;display:flex;align-items:center;justify-content:center;gap:.5rem
 }
 .btn-copy{background:none;border:1px solid var(--card-border);color:var(--gold);border-radius:6px;padding:.18rem .5rem;font-size:.88rem;cursor:pointer}
+.btn-add-bot{background:rgba(201,168,76,.12);border:1px solid rgba(201,168,76,.3);color:var(--gold);border-radius:6px;padding:.28rem .7rem;font-size:.78rem;cursor:pointer;font-family:inherit;transition:background .15s}
+.btn-add-bot:hover{background:rgba(201,168,76,.22)}
+.bot-badge{display:inline-block;background:rgba(100,180,240,.15);color:#8ecdf5;border-radius:10px;font-size:.6rem;padding:.05rem .35rem;margin-left:.3rem;vertical-align:middle}
 .btn-copy:hover{background:rgba(201,168,76,.1)}
 .seat-list{display:flex;flex-direction:column;gap:.45rem}
 .seat-row{
@@ -607,6 +939,7 @@ $$('btn-copy-code').addEventListener('click',()=>{
   navigator.clipboard.writeText(myRoom).then(()=>{$$('btn-copy-code').textContent='✓';setTimeout(()=>$$('btn-copy-code').textContent='⧉',1500)})
 });
 $$('btn-start').addEventListener('click',()=>socket.emit('startGame'));
+$$('btn-add-bot').addEventListener('click',()=>socket.emit('addBot'));
 $$('btn-next-hand').addEventListener('click',()=>{socket.emit('nextHand');hideFull('overlay-hand-end')});
 $$('btn-play-again').addEventListener('click',()=>location.reload());
 function setErr(id,msg){$$(id).textContent=msg}
@@ -628,6 +961,7 @@ socket.on('joined',({code,seat,name})=>{
   $$('display-code').textContent=code;
   $$('score-room-code').textContent=code;
   $$('btn-start').style.display=seat===0?'block':'none';
+  $$('btn-add-bot').style.display=seat===0?'block':'none';
   showScreen('screen-waiting');
   sessionStorage.setItem('42-room',code);sessionStorage.setItem('42-seat',seat);sessionStorage.setItem('42-name',name)
 });
@@ -645,9 +979,13 @@ function renderWaiting(state){
     const seat=state.seats[i],team=i%2===0?1:2;
     const row=document.createElement('div');
     row.className='seat-row'+(seat?'':' empty');
-    row.innerHTML='<span class="seat-num">'+(i+1)+'</span><span>'+(seat?seat.name:'Empty')+'</span><span class="seat-team">'+pos+' · Team '+team+'</span>';
+    const botBadge=seat&&seat.isBot?'<span class="bot-badge">BOT</span>':'';
+    row.innerHTML='<span class="seat-num">'+(i+1)+'</span><span>'+(seat?seat.name:'Empty')+botBadge+'</span><span class="seat-team">'+pos+' · Team '+team+'</span>';
     list.appendChild(row)
-  })
+  });
+  // Hide add-bot if room is full
+  const addBotBtn=$$('btn-add-bot');
+  if(addBotBtn) addBotBtn.style.display=state.seats.some(s=>s===null)?'block':'none';
 }
 
 function teamOf(seat){return seat%2===0?1:2}
@@ -702,7 +1040,8 @@ function renderGame(state){
     if(!nameEl||!handEl)continue;
     const seat=state.seats[s];
     const team=teamOf(s);
-    let nameHtml=(seat?seat.name:'Seat '+(s+1))+'<span class="team-badge">T'+team+'</span>';
+    const botMark=seat&&seat.isBot?'<span class="bot-badge">BOT</span>':'';
+    let nameHtml=(seat?seat.name:'Seat '+(s+1))+botMark+'<span class="team-badge">T'+team+'</span>';
     if(s===state.dealer)nameHtml+='<span class="dealer-chip">D</span>';
     nameEl.innerHTML=nameHtml;
     const isActive=
@@ -960,6 +1299,7 @@ function getHTML() {
     </div>
     <div id="seat-list" class="seat-list"></div>
     <p class="waiting-hint">Share the room code with your friends</p>
+    <button id="btn-add-bot" class="btn-add-bot" style="display:none">+ Add Bot</button>
     <button id="btn-start" class="btn-primary" style="display:none">Start Game</button>
     <p id="waiting-error" class="error-msg"></p>
   </div>
@@ -1116,7 +1456,7 @@ function pubRoom(room) {
 function broadcast(room) {
   for (let i = 0; i < 4; i++) {
     const seat = room.seats[i];
-    if (!seat || seat.disconnected) continue;
+    if (!seat || seat.disconnected || seat.isBot) continue; // skip bots
     const availableBids = (room.state === 'bidding' && room.currentBidder === i)
       ? getAvailableBids(room.bid, room.hands[i], room.bids, i === room.dealer, dealerForced(room)) : [];
     io.to(seat.socketId).emit('state', { ...pubRoom(room), myHand: room.hands[i], mySeat: i, availableBids });
@@ -1143,6 +1483,7 @@ function startBidding(room) {
   room.currentBidder = (room.dealer + 1) % 4;
   room.state = 'bidding';
   broadcast(room);
+  scheduleBotAction(room);
 }
 
 function advanceBidder(room) {
@@ -1168,7 +1509,8 @@ function openTrumpSelect(room) {
     room.sittingOut = (bid.seatIndex + 2) % 4; // partner sits out
     room.currentPlayer = bid.seatIndex;
     room.state = 'playing';
-    broadcast(room); return;
+    broadcast(room);
+    scheduleBotAction(room); return;
   }
   if (bid.type === 'plunge') {
     room.trumpSelector = (bid.seatIndex + 2) % 4; // partner picks trump & leads
@@ -1189,6 +1531,7 @@ function startPlay(room, trump, followMe) {
     : room.bid.seatIndex;            // bidder leads otherwise
   room.state = 'playing';
   broadcast(room);
+  scheduleBotAction(room);
 }
 
 
@@ -1256,6 +1599,20 @@ io.on('connection', socket => {
     broadcast(room);
   });
 
+  socket.on('addBot', () => {
+    const found = findRoom(socket.id); if (!found) return;
+    const { room, seat } = found;
+    if (seat !== 0) { socket.emit('error','Only host can add bots'); return; }
+    if (room.state !== 'lobby') { socket.emit('error','Game already started'); return; }
+    const emptySeat = room.seats.findIndex(s => s === null);
+    if (emptySeat === -1) { socket.emit('error','Room is full'); return; }
+    // Pick a bot name not already in use
+    const usedNames = room.seats.filter(Boolean).map(s => s.name);
+    const botName = BOT_NAMES.find(n => !usedNames.includes(n)) || ('Bot' + (emptySeat + 1));
+    room.seats[emptySeat] = { socketId: null, name: botName, isBot: true };
+    broadcast(room);
+  });
+
   socket.on('startGame', () => {
     const found = findRoom(socket.id); if (!found) return;
     const { room, seat } = found;
@@ -1293,6 +1650,7 @@ io.on('connection', socket => {
 
     advanceBidder(room);
     broadcast(room);
+    scheduleBotAction(room);
   });
 
   socket.on('selectTrump', ({ trump, followMe }) => {
@@ -1301,6 +1659,7 @@ io.on('connection', socket => {
     if (!['trump_select','plunge_trump_select'].includes(room.state)) return;
     if (room.trumpSelector !== seat) return;
     startPlay(room, trump, followMe);
+    // scheduleBotAction already called inside startPlay
   });
 
   socket.on('playTile', ({ tileId }) => {
@@ -1380,7 +1739,10 @@ io.on('connection', socket => {
 
   socket.on('nextHand', () => {
     const found = findRoom(socket.id); if (!found) return;
-    if (found.room.state === 'hand_end') startBidding(found.room);
+    if (found.room.state === 'hand_end') {
+      startBidding(found.room);
+      // scheduleBotAction already called inside startBidding
+    }
   });
 
   socket.on('disconnect', () => {
