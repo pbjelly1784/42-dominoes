@@ -95,8 +95,24 @@ function trickWinner(plays, trump, isLow) {
   }
 
   // Normal / high hand logic
-  const ledSuit = tileSuit(leadTile, trump);
   const leadIsTrump = isTrump(leadTile, trump);
+  // Led suit = the end of the lead tile that is NOT trump (or trump suit if lead is trump)
+  const ledSuit = leadIsTrump ? trump : leadTile.hi;
+
+  // Does a tile follow the led suit? Checks BOTH ends (e.g. 6-4 follows fours suit)
+  function followsLed(tile) {
+    if (isTrump(tile, trump)) return false; // trump tiles don't follow non-trump suit
+    return tile.hi === ledSuit || tile.lo === ledSuit;
+  }
+  // Strength of a tile within the led suit = the end that is NOT the led suit number
+  // e.g. 6-4 in fours suit has strength 6; 4-3 in fours suit has strength 3
+  // Doubles (e.g. 4-4) beat all non-doubles within their suit
+  function suitStrength(tile) {
+    if (isDouble(tile)) return 100 + tile.hi;
+    if (tile.hi === ledSuit) return tile.lo;
+    return tile.hi; // lo === ledSuit, so hi is the power end
+  }
+
   let best = plays[0];
   let bestIsTrump = leadIsTrump;
 
@@ -108,11 +124,15 @@ function trickWinner(plays, trump, isLow) {
     } else if (pTrump && bestIsTrump) {
       if (tileStrength(p.tile) > tileStrength(best.tile)) best = p;
     } else if (!pTrump && !bestIsTrump) {
-      const pSuit = tileSuit(p.tile, trump);
-      const bestSuit = tileSuit(best.tile, trump);
-      if (pSuit === ledSuit) {
-        if (bestSuit !== ledSuit) best = p;
-        else if (tileStrength(p.tile) > tileStrength(best.tile)) best = p;
+      const pFollows = followsLed(p.tile);
+      const bestFollows = followsLed(best.tile) || (leadIsTrump ? false : best.tile === leadTile);
+      const bestActuallyFollows = best.tile === leadTile || followsLed(best.tile);
+      if (pFollows) {
+        if (!bestActuallyFollows) {
+          best = p;
+        } else {
+          if (suitStrength(p.tile) > suitStrength(best.tile)) best = p;
+        }
       }
     }
   }
@@ -175,8 +195,9 @@ function scoreHand(bid, trickCount, pointsTaken) {
     delta[won ? bidTeam : defTeam] = bid.marks || 1;
     return delta;
   }
-  // High / follow_me — always need 42 total points regardless of bid amount (84, 126 etc. only affect marks)
-  const won = bidTotal >= 42;
+  // High / follow_me — need bid.amount points (max 42; bids over 42 still only need 42)
+  const threshold = Math.min(bid.amount, 42);
+  const won = bidTotal >= threshold;
   delta[won ? bidTeam : defTeam] = bid.marks || 1;
   return delta;
 }
@@ -415,6 +436,24 @@ input[type=text]::placeholder{color:var(--text-dim)}
 .overlay-full-card h3{font-family:'Playfair Display',serif;color:var(--gold);font-size:1.3rem;text-align:center}
 .bid-subtitle{text-align:center;font-size:.8rem;color:var(--text-dim)}
 
+/* Bid history — small window shown above bid panel during bidding */
+#bid-history{
+  position:absolute;bottom:calc(160px + 44px);left:50%;transform:translateX(-50%);
+  z-index:199;min-width:280px;max-width:460px;pointer-events:none
+}
+#bid-history.hidden{display:none}
+#bid-history-inner{
+  background:rgba(8,24,14,.78);border:1px solid rgba(201,168,76,.25);
+  border-radius:var(--radius) var(--radius) 0 0;backdrop-filter:blur(2px);
+  padding:.4rem .8rem .5rem
+}
+#bid-history-inner h4{font-size:.68rem;color:var(--gold);letter-spacing:.06em;margin-bottom:.3rem;text-align:center}
+.bid-hist-row{display:flex;align-items:center;gap:.5rem;font-size:.72rem;padding:.1rem 0}
+.bid-hist-name{color:var(--text-dim);min-width:70px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bid-hist-val{color:var(--ivory);font-weight:500}
+.bid-hist-val.pass{color:var(--text-dim);font-style:italic}
+.bid-hist-val.special{color:var(--gold)}
+
 /* Bid panel — compact centered floating overlay */
 #bid-panel{
   position:absolute;bottom:160px;left:50%;transform:translateX(-50%);
@@ -534,6 +573,23 @@ function $$(id){return document.getElementById(id)}
 function showFull(id){$$(id).classList.remove('hidden')}
 function hideFull(id){$$(id).classList.add('hidden')}
 function hideAllOverlays(){['overlay-hand-end','overlay-game-over'].forEach(hideFull);$$('bid-panel').classList.add('hidden');$$('trump-panel').classList.add('hidden')}
+function renderBidHistory(state){
+  const hist=$$('bid-history'),rows=$$('bid-history-rows');
+  if(!state.bids||state.bids.length===0||state.state==='playing'||state.state==='trump_select'||state.state==='plunge_trump_select'){
+    hist.classList.add('hidden');return
+  }
+  hist.classList.remove('hidden');
+  rows.innerHTML='';
+  state.bids.forEach(b=>{
+    const seat=state.seats[b.seatIndex];
+    const name=seat?seat.name:'?';
+    const row=document.createElement('div');row.className='bid-hist-row';
+    const isPass=b.type==='pass';
+    const isSpecial=b.type==='plunge'||b.type==='low'||b.type==='follow_me';
+    row.innerHTML='<span class="bid-hist-name">'+name+'</span><span class="bid-hist-val'+(isPass?' pass':isSpecial?' special':'')+'">'+b.label+'</span>';
+    rows.appendChild(row)
+  })
+}
 
 // Lobby
 $$('btn-create').addEventListener('click',()=>{
@@ -616,10 +672,13 @@ function renderGame(state){
     else if(state.bidType==='follow_me') trumpStr='Follow Me'+(state.trickTrump!==null&&state.trickTrump!==undefined?' — trick trump: '+SUIT[state.trickTrump]:'');
     else if(state.trump!==null&&state.trump!==undefined) trumpStr='Trump: '+SUIT[state.trump];
     const bidStr=state.bid?state.bid.label:'—';
+    const bidTeamNum=state.bid&&state.bid.seatIndex>=0?(state.bid.seatIndex%2)+1:0;
+    const bidderName=state.bid&&state.bid.seatIndex>=0&&state.seats[state.bid.seatIndex]?state.seats[state.bid.seatIndex].name:'';
+    const bidTeamStr=bidTeamNum?'<span class="banner-val" style="color:#a8e6cf">Team '+bidTeamNum+' ('+bidderName+')</span>':'—';
     banner.innerHTML=
       '<span class="banner-item">&#9670; <span class="banner-val">'+trumpStr+'</span></span>'+
       '<span class="banner-sep">|</span>'+
-      '<span class="banner-item">Bid: <span class="banner-val">'+bidStr+'</span></span>';
+      '<span class="banner-item">Bid: <span class="banner-val">'+bidStr+'</span> — '+bidTeamStr+'</span>';
     banner.classList.add('visible')
   } else banner.classList.remove('visible');
 
@@ -628,7 +687,7 @@ function renderGame(state){
   if(state.state==='playing'){
     const t1pts=(state.pointsTaken[0]||0)+(state.pointsTaken[2]||0);
     const t2pts=(state.pointsTaken[1]||0)+(state.pointsTaken[3]||0);
-    const needed=state.bid&&state.bid.type==='low'?0:(state.bid&&state.bid.type==='plunge'?42:42);
+    const needed=state.bid?Math.min(state.bid.amount,42):42;
     const bidTeam=state.bid?(state.bid.seatIndex%2===0?1:2):0;
     pb.innerHTML=
       '<div class="pts-team"><span class="pts-label">Team 1:</span><span class="pts-val">'+t1pts+' pts</span>'+(bidTeam===1?'<span class="pts-need">need '+needed+'</span>':'')+'</div>'+
@@ -676,6 +735,7 @@ function renderGame(state){
 
   renderTrickArea(state);
   renderBoneyard(state);
+  renderBidHistory(state);
   hideAllOverlays();
 
   if(state.state==='bidding'&&state.currentBidder===mySeat){
@@ -745,14 +805,33 @@ function renderTrickArea(state){
 
 function renderBoneyard(state){
   const drawer=$$('boneyard-drawer');
-  drawer.innerHTML='<h4>Boneyard — '+((state.boneyard||[]).length)+' tiles</h4>';
-  if(!state.boneyard||state.boneyard.length===0){
-    drawer.innerHTML+='<p class="by-empty">No tricks completed yet</p>';return
-  }
-  // Group into tricks of 4 (or 3 for low hands)
+  // For 84+ bids, only show most recent completed trick (stacked in real life)
+  const highBid=state.bid&&state.bid.amount>=84;
   const trickSize=state.sittingOut>=0?3:4;
+  const boneyard=state.boneyard||[];
+
+  if(highBid){
+    drawer.innerHTML='<h4>Last trick ('+(boneyard.length/trickSize|0)+' played)</h4>';
+    if(boneyard.length===0){drawer.innerHTML+='<p class="by-empty">No tricks yet</p>';return}
+    // Show only the last trick
+    const lastTrick=boneyard.slice(-trickSize);
+    const row=document.createElement('div');row.className='by-trick';
+    const num=document.createElement('span');num.className='by-trick-num';num.textContent='Last:';
+    row.appendChild(num);
+    lastTrick.forEach(tile=>{
+      const el=document.createElement('div');el.className='by-tile';
+      el.innerHTML='<span class="bt">'+tile.hi+'</span><div class="bd"></div><span class="bt">'+tile.lo+'</span>';
+      row.appendChild(el)
+    });
+    drawer.appendChild(row);
+    return;
+  }
+
+  // Normal bids: show all tricks
+  drawer.innerHTML='<h4>Boneyard — '+boneyard.length+' tiles</h4>';
+  if(boneyard.length===0){drawer.innerHTML+='<p class="by-empty">No tricks completed yet</p>';return}
   const tricks=[];
-  for(let i=0;i<state.boneyard.length;i+=trickSize)tricks.push(state.boneyard.slice(i,i+trickSize));
+  for(let i=0;i<boneyard.length;i+=trickSize)tricks.push(boneyard.slice(i,i+trickSize));
   tricks.forEach((trick,ti)=>{
     const row=document.createElement('div');row.className='by-trick';
     const num=document.createElement('span');num.className='by-trick-num';num.textContent=(ti+1)+'.';
@@ -940,6 +1019,14 @@ function getHTML() {
       <div id="boneyard-drawer"></div>
     </div>
 
+    <!-- Bid history (shown during bidding) -->
+    <div id="bid-history" class="hidden">
+      <div id="bid-history-inner">
+        <h4>BIDS THIS ROUND</h4>
+        <div id="bid-history-rows"></div>
+      </div>
+    </div>
+
     <!-- Bid panel (right side) -->
     <div id="bid-panel" class="hidden">
       <div id="bid-panel-inner">
@@ -1004,7 +1091,7 @@ const rooms = new Map();
 
 function makeRoom(code) {
   return {
-    code, seats: [null,null,null,null], state: 'lobby', earlyEndReason: null,
+    code, seats: [null,null,null,null], state: 'lobby', earlyEndReason: null, trickJustResolved: false,
     hands: [[],[],[],[]], bid: null, bids: [],
     currentBidder: 0, trump: null, bidType: null,
     trickTrump: null, trumpSelector: -1, sittingOut: -1,
@@ -1022,7 +1109,7 @@ function pubRoom(room) {
     trumpSelector: room.trumpSelector, sittingOut: room.sittingOut,
     trick: room.trick, trickCount: room.trickCount, pointsTaken: room.pointsTaken,
     currentPlayer: room.currentPlayer, score: room.score, dealer: room.dealer,
-    lastTrick: room.lastTrick, handHistory: room.handHistory, boneyard: room.boneyard, earlyEndReason: room.earlyEndReason,
+    lastTrick: room.lastTrick, handHistory: room.handHistory, boneyard: room.boneyard, earlyEndReason: room.earlyEndReason, trickJustResolved: room.trickJustResolved,
   };
 }
 
@@ -1052,7 +1139,7 @@ function startBidding(room) {
   room.trump = null; room.bidType = null; room.trickTrump = null;
   room.trumpSelector = -1; room.sittingOut = -1;
   room.trick = []; room.trickCount = [0,0,0,0]; room.pointsTaken = [0,0,0,0];
-  room.lastTrick = null; room.boneyard = []; room.earlyEndReason = null;   // reset each hand
+  room.lastTrick = null; room.boneyard = []; room.earlyEndReason = null; room.trickJustResolved = false;   // reset each hand
   room.currentBidder = (room.dealer + 1) % 4;
   room.state = 'bidding';
   broadcast(room);
@@ -1128,8 +1215,8 @@ function isMathematicallySet(bid, trickCount, pointsTaken, hands, sittingOut) {
   const maxRemaining = remainingPipPts + tricksLeft;
   const maxPossible = bidTeamSoFar + maxRemaining;
 
-  // Win condition is always 42 points regardless of bid amount (84/126/etc. only affect marks)
-  return maxPossible < 42;
+  // Win needs min(bid.amount, 42) points
+  return maxPossible < Math.min(bid.amount, 42);
 }
 
 function resolveHand(room) {
@@ -1220,6 +1307,7 @@ io.on('connection', socket => {
     const found = findRoom(socket.id); if (!found) return;
     const { room, seat } = found;
     if (room.state !== 'playing') return;
+    if (room.trickJustResolved) { socket.emit('error','Wait for trick to clear'); return; }
     if (room.currentPlayer !== seat) { socket.emit('error','Not your turn'); return; }
     if (room.sittingOut === seat) { socket.emit('error','You are sitting out'); return; }
 
@@ -1254,26 +1342,33 @@ io.on('connection', socket => {
       room.trickCount[winner]++;
       room.boneyard.push(...room.trick.map(p => p.tile));
       room.lastTrick = { plays: [...room.trick], winner };
-      room.trick = [];
-      room.trickTrump = null;
+      // Don't clear trick yet — show it for 4 seconds first
+      room.trickJustResolved = true;
+      broadcast(room);
 
-      // 42 Low: if BIDDER takes a trick, hand ends immediately (bidder loses)
-      if (room.bidType === 'low' && winner === room.bid.seatIndex) {
-        room.earlyEndReason = 'bidder_took_trick';
-        resolveHand(room); return;
-      }
-
+      // Check end conditions
       const totalTricks = room.trickCount.reduce((a,b)=>a+b,0);
-      if (totalTricks === 7) { resolveHand(room); return; }
+      const lowBidderTookTrick = room.bidType === 'low' && winner === room.bid.seatIndex;
+      const mathSet = isMathematicallySet(room.bid, room.trickCount, room.pointsTaken, room.hands, room.sittingOut);
 
-      // Check if bidding team is mathematically set (cannot reach their bid)
-      if (isMathematicallySet(room.bid, room.trickCount, room.pointsTaken, room.hands, room.sittingOut)) {
-        room.earlyEndReason = 'mathematically_set';
-        resolveHand(room); return;
-      }
+      setTimeout(() => {
+        room.trick = [];
+        room.trickTrump = null;
+        room.trickJustResolved = false;
 
-      // Next leader = winner (skip sitting out — winner can't be sittingOut)
-      room.currentPlayer = winner;
+        if (lowBidderTookTrick) {
+          room.earlyEndReason = 'bidder_took_trick';
+          resolveHand(room); return;
+        }
+        if (totalTricks === 7) { resolveHand(room); return; }
+        if (mathSet) {
+          room.earlyEndReason = 'mathematically_set';
+          resolveHand(room); return;
+        }
+        room.currentPlayer = winner;
+        broadcast(room);
+      }, 4000);
+      return;  // early return — broadcast already sent above
     } else {
       // Advance to next active player
       let next = (seat + 1) % 4;
