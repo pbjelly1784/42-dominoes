@@ -562,6 +562,7 @@ function scheduleBotAction(room) {
       if (room.state !== 'bidding' || room.currentBidder !== seat) return;
       const available = getAvailableBids(room.bid, room.hands[seat], room.bids, seat === room.dealer, dealerForced(room));
       const chosen = botChooseBid(available, room.hands[seat], room.bids, seat);
+      room.botLog.push({ ts: Date.now(), bot: room.seats[seat].name, action: 'bid', hand: room.hands[seat].map(t=>t.id), chosen: chosen ? chosen.label : 'null', state: 'bidding' });
       const label = chosen.type === 'pass' ? 'Pass'
         : chosen.type === 'low'    ? `${chosen.amount} Low`
         : chosen.type === 'plunge' ? (chosen.amount <= 84 ? 'Plunge (4+ doubles)' : `${chosen.amount} Plunge (4+ doubles)`)
@@ -582,6 +583,7 @@ function scheduleBotAction(room) {
       if (room.state !== 'trump_select' && room.state !== 'plunge_trump_select') return;
       if (room.trumpSelector !== seat) return;
       const trump = botChooseTrump(room.hands[seat]);
+      room.botLog.push({ ts: Date.now(), bot: room.seats[seat].name, action: 'trump_select', hand: room.hands[seat].map(t=>t.id), chosen: trump, state: room.state });
       startPlay(room, trump, false); // startPlay calls scheduleBotAction internally
     }, botDelay());
 
@@ -593,8 +595,22 @@ function scheduleBotAction(room) {
     setTimeout(() => {
       if (room.state !== 'playing' || room.currentPlayer !== seat || room.trickJustResolved) return;
       const hand = room.hands[seat];
+      const legal = hand.filter(t => isLegalPlay(t, hand, room.trick, room.trump, room.bidType, room.trickTrump));
       const tile = botChooseTile(hand, room.trick, room.trump, room.bidType, room.trickTrump, seat, room.bid);
-      if (!tile) return;
+      const logEntry = {
+        ts: Date.now(), bot: room.seats[seat].name, action: 'play',
+        hand: hand.map(t=>t.id),
+        legal: legal.map(t=>t.id),
+        trick: room.trick.map(p=>({seat:p.seatIndex, tile:p.tile.id})),
+        trump: room.trump, bidType: room.bidType, trickTrump: room.trickTrump,
+        chosen: tile ? tile.id : 'NULL — FREEZE',
+        state: room.state,
+      };
+      room.botLog.push(logEntry);
+      if (!tile) {
+        room.botLog.push({ ts: Date.now(), bot: room.seats[seat].name, action: 'ERROR', msg: 'botChooseTile returned null/undefined', hand: hand.map(t=>t.id), legal: legal.map(t=>t.id) });
+        broadcast(room); return;
+      }
       const idx = hand.findIndex(t => t.id === tile.id);
       if (idx === -1) return;
 
@@ -706,6 +722,35 @@ input[type=text]::placeholder{color:var(--text-dim)}
 .seat-row .seat-team{font-size:.72rem;color:var(--text-dim);margin-left:auto}
 .seat-row.empty{opacity:.4;font-style:italic}
 .waiting-hint{text-align:center;font-size:.8rem;color:var(--text-dim)}
+
+/* Debug panel */
+#debug-btn{
+  position:absolute;bottom:8px;right:8px;z-index:300;
+  background:rgba(220,80,80,.15);border:1px solid rgba(220,80,80,.4);
+  color:#e07070;border-radius:6px;padding:.3rem .65rem;font-size:.7rem;
+  font-family:inherit;cursor:pointer;display:none
+}
+#debug-btn.visible{display:block}
+#debug-btn:hover{background:rgba(220,80,80,.25)}
+#debug-overlay{
+  position:absolute;inset:0;z-index:400;background:rgba(0,0,0,.88);
+  display:none;flex-direction:column;padding:1rem;gap:.6rem;overflow:hidden
+}
+#debug-overlay.open{display:flex}
+#debug-header{display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
+#debug-header h3{font-family:'Playfair Display',serif;color:#e07070;font-size:1rem}
+#debug-close{background:none;border:1px solid rgba(220,80,80,.4);color:#e07070;border-radius:6px;padding:.25rem .6rem;cursor:pointer;font-family:inherit;font-size:.8rem}
+#debug-log{
+  flex:1;overflow-y:auto;font-size:.72rem;font-family:monospace;color:#c0c0b0;
+  background:rgba(0,0,0,.5);border:1px solid rgba(255,255,255,.1);border-radius:6px;padding:.6rem;
+  line-height:1.6
+}
+.dlog-entry{border-bottom:1px solid rgba(255,255,255,.06);padding:.3rem 0;margin-bottom:.2rem}
+.dlog-error{color:#ff6b6b;font-weight:bold}
+.dlog-bid{color:#c9a84c}
+.dlog-trump{color:#8ecdf5}
+.dlog-play{color:#a8e6cf}
+.dlog-null{color:#ff4444;font-weight:bold}
 
 /* Score / info bar */
 .score-bar{
@@ -1124,6 +1169,7 @@ function renderGame(state){
   renderTrickArea(state);
   renderBoneyard(state);
   renderBidHistory(state);
+  updateDebugPanel(state);
   hideAllOverlays();
 
   if(state.state==='bidding'&&state.currentBidder===mySeat){
@@ -1306,6 +1352,48 @@ socket.on('connect',()=>{
   const code=sessionStorage.getItem('42-room'),seat=sessionStorage.getItem('42-seat'),name=sessionStorage.getItem('42-name');
   if(code&&seat!==null&&name){mySeat=parseInt(seat);myRoom=code;myName=name;socket.emit('rejoin',{code,seat:parseInt(seat),name})}
 });
+
+// Debug panel
+$$('debug-btn').addEventListener('click',()=>$$('debug-overlay').classList.add('open'));
+$$('debug-close').addEventListener('click',()=>$$('debug-overlay').classList.remove('open'));
+
+function updateDebugPanel(state){
+  const hasBots=state.seats&&state.seats.some(s=>s&&s.isBot);
+  $$('debug-btn').classList.toggle('visible',!!hasBots);
+  if(!hasBots)return;
+  const log=$$('debug-log');
+  const entries=(state.botLog||[]);
+  log.innerHTML='';
+  if(entries.length===0){log.innerHTML='<div style="color:var(--text-dim);font-style:italic">No bot actions yet this hand</div>';return}
+  // Show latest 30 entries, most recent first
+  [...entries].reverse().slice(0,30).forEach(e=>{
+    const div=document.createElement('div');
+    div.className='dlog-entry';
+    const time=new Date(e.ts).toLocaleTimeString();
+    const isNull=e.chosen==='NULL — FREEZE'||e.action==='ERROR';
+    div.classList.toggle('dlog-error',isNull);
+    if(e.action==='bid'){
+      div.classList.add('dlog-bid');
+      div.innerHTML='['+time+'] <b>'+e.bot+'</b> BID → <b>'+e.chosen+'</b><br>'+'Hand: '+e.hand.join(', ');
+    } else if(e.action==='trump_select'){
+      div.classList.add('dlog-trump');
+      div.innerHTML='['+time+'] <b>'+e.bot+'</b> TRUMP → <b>'+e.chosen+'</b><br>'+'Hand: '+e.hand.join(', ');
+    } else if(e.action==='play'){
+      div.classList.add(isNull?'dlog-null':'dlog-play');
+      const trickStr=e.trick.map(p=>'S'+p.seat+':'+p.tile).join(', ');
+      div.innerHTML='['+time+'] <b>'+e.bot+'</b> PLAY → <b>'+e.chosen+'</b>'
+        +'<br>Hand: '+e.hand.join(', ')
+        +'<br>Legal: '+e.legal.join(', ')
+        +'<br>Trick so far: '+(trickStr||'(leading)')
+        +'<br>Trump: '+e.trump+' | BidType: '+e.bidType+' | TrickTrump: '+e.trickTrump;
+    } else if(e.action==='ERROR'){
+      div.innerHTML='['+time+'] &#9888; <b>'+e.bot+'</b> ERROR: '+e.msg
+        +'<br>Hand: '+e.hand.join(', ')
+        +'<br>Legal: '+e.legal.join(', ');
+    }
+    log.appendChild(div);
+  });
+}
 `;
 
 // ─── HTML ─────────────────────────────────────────────────────────────────────
@@ -1457,6 +1545,16 @@ function getHTML() {
       <button id="btn-play-again" class="btn-primary" style="margin-top:.5rem">Play Again</button>
     </div>
   </div>
+
+  <!-- Debug button + overlay (only shown when bots present) -->
+  <button id="debug-btn">&#9881; Bot Debug</button>
+  <div id="debug-overlay">
+    <div id="debug-header">
+      <h3>Bot Debug Log</h3>
+      <button id="debug-close">Close</button>
+    </div>
+    <div id="debug-log"></div>
+  </div>
 </div>
 
 <script src="/socket.io/socket.io.js"></script>
@@ -1480,7 +1578,7 @@ const rooms = new Map();
 
 function makeRoom(code) {
   return {
-    code, seats: [null,null,null,null], state: 'lobby', earlyEndReason: null, trickJustResolved: false,
+    code, seats: [null,null,null,null], state: 'lobby', earlyEndReason: null, trickJustResolved: false, botLog: [],
     hands: [[],[],[],[]], bid: null, bids: [],
     currentBidder: 0, trump: null, bidType: null,
     trickTrump: null, trumpSelector: -1, sittingOut: -1,
@@ -1498,7 +1596,7 @@ function pubRoom(room) {
     trumpSelector: room.trumpSelector, sittingOut: room.sittingOut,
     trick: room.trick, trickCount: room.trickCount, pointsTaken: room.pointsTaken,
     currentPlayer: room.currentPlayer, score: room.score, dealer: room.dealer,
-    lastTrick: room.lastTrick, handHistory: room.handHistory, boneyard: room.boneyard, earlyEndReason: room.earlyEndReason, trickJustResolved: room.trickJustResolved,
+    lastTrick: room.lastTrick, handHistory: room.handHistory, boneyard: room.boneyard, earlyEndReason: room.earlyEndReason, trickJustResolved: room.trickJustResolved, botLog: room.botLog,
   };
 }
 
@@ -1528,7 +1626,7 @@ function startBidding(room) {
   room.trump = null; room.bidType = null; room.trickTrump = null;
   room.trumpSelector = -1; room.sittingOut = -1;
   room.trick = []; room.trickCount = [0,0,0,0]; room.pointsTaken = [0,0,0,0];
-  room.lastTrick = null; room.boneyard = []; room.earlyEndReason = null; room.trickJustResolved = false;   // reset each hand
+  room.lastTrick = null; room.boneyard = []; room.earlyEndReason = null; room.trickJustResolved = false; room.botLog = [];   // reset each hand
   room.currentBidder = (room.dealer + 1) % 4;
   room.state = 'bidding';
   broadcast(room);
